@@ -1,0 +1,9 @@
+[workspace]
+members = [
+    "chainloader",
+]
+
+[profile.release]
+debug = true
+opt-level = 's'
+lto = true
