@@ -59,6 +59,7 @@ pub async fn button_task(control_mutex: &'static Mutex::<NoopRawMutex, Control<'
         embassy_rp::multicore::resume_core1();
 
         if !prev_state && button_state {
+            defmt::info!("Resetting");
             // On press, turn LED on
             let mut control = control_mutex.lock().await;
             control.gpio_set(0, true).await;

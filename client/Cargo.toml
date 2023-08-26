@@ -1,0 +1,10 @@
+[package]
+name = "client"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+defmt-decoder = { version = "0.3.8", features = ["unstable"] }
+anyhow = "1"
+log = "0.4.20"
+ouroboros = "0.17.2"

@@ -1,7 +1,13 @@
+cargo-features = ["per-package-target"]
+
 [workspace]
 members = [
     "chainloader",
+   # "chainload-app",
+    "client",
 ]
+default-members = ["chainloader"]
+resolver = "2"
 
 [profile.release]
 debug = true
