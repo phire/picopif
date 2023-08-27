@@ -1,22 +1,35 @@
-use core::{task::{Poll, Context}, future::Future, ops::DerefMut, cmp::min, pin::Pin};
+use core::{
+    cmp::min,
+    future::Future,
+    pin::Pin,
+    sync::atomic::{AtomicBool, Ordering},
+    task::{Context, Poll},
+};
 
 use embassy_futures::select::{select, Either};
-use embassy_net::{tcp::{Error, TcpSocket}, Stack, IpEndpoint, udp::{PacketMetadata, UdpSocket}};
-use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, mutex::{Mutex, MutexGuard}, waitqueue::AtomicWaker};
-use embassy_time::{Timer, Duration};
+use embassy_net::{
+    tcp::{Error, TcpSocket},
+    udp::{PacketMetadata, UdpSocket},
+    IpEndpoint, Stack, driver::Driver,
+};
+use embassy_sync::waitqueue::WakerRegistration;
+use embassy_time::{Duration, Timer};
 use static_cell::make_static;
 
-static mut LOG_BUFFER: Mutex<CriticalSectionRawMutex, heapless::Deque<u8, 1024>> = Mutex::new(heapless::Deque::new());
-static mut GUARD: Option<MutexGuard<'_, CriticalSectionRawMutex, heapless::Deque<u8, 1024>>> = None;
+static mut CS_RESTORE: critical_section::RestoreState = critical_section::RestoreState::invalid();
+
+// used to detect reentrant calls to global logger
+static TAKEN: AtomicBool = AtomicBool::new(false);
+
+static mut LOG_BUFFER: heapless::Deque<u8, 1024> = heapless::Deque::new();
+static mut WAKER: WakerRegistration = WakerRegistration::new();
 static mut ENCODER: defmt::Encoder = defmt::Encoder::new();
 
 fn push_bytes(bytes: &[u8]) {
     unsafe {
-        if let Some(guard) = &mut GUARD {
-            let buffer = guard.deref_mut();
-
-            bytes.into_iter().try_for_each(|b| buffer.push_back(*b).ok());
-        }
+        bytes
+            .into_iter()
+            .try_for_each(|&b| LOG_BUFFER.push_back(b).ok());
     }
 }
 
@@ -25,71 +38,87 @@ struct Logger;
 
 unsafe impl defmt::Logger for Logger {
     fn acquire() {
-        // TODO: for correctness, replace mutex with critical_section::acquire
+        let restore = unsafe { critical_section::acquire() };
+
+        if TAKEN.load(Ordering::Relaxed) {
+            panic!("defmt logger taken reentrantly");
+        }
+
+        TAKEN.store(true, Ordering::Relaxed);
+        unsafe { CS_RESTORE = restore };
         unsafe {
-            if let Ok(mut buffer) =  LOG_BUFFER.try_lock() {
-                if buffer.len() > 1000 {
-                    // Buffer is full, drop it
-                    buffer.clear();
-                }
-                GUARD = Some(buffer);
-                ENCODER.start_frame(push_bytes);
-            }
+            ENCODER.start_frame(push_bytes);
         }
     }
     unsafe fn flush() {
         // Can't actually flush, as that would require async code
+        // Though, maybe we could force the executor to prioritize the wifi/net tasks?
     }
     unsafe fn release() {
         ENCODER.end_frame(push_bytes);
-        GUARD = None;
+        TAKEN.store(false, Ordering::Relaxed);
         WAKER.wake();
+
+        critical_section::release(CS_RESTORE);
     }
     unsafe fn write(bytes: &[u8]) {
         ENCODER.write(bytes, push_bytes);
     }
 }
 
-static WAKER : AtomicWaker = AtomicWaker::new();
-
 struct LogWaitFuture;
 impl Future for LogWaitFuture {
-    type Output = MutexGuard<'static, CriticalSectionRawMutex, heapless::Deque<u8, 1024>>;
+    type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         critical_section::with(|_| unsafe {
-            match LOG_BUFFER.try_lock() {
-                Ok(buffer) if !buffer.is_empty() => {
-                    return Poll::Ready(buffer);
-                }
-                _ => {
-                    WAKER.register(cx.waker());
-                    return Poll::Pending;
-                }
+            if LOG_BUFFER.is_empty() {
+                WAKER.register(cx.waker());
+                return Poll::Pending;
             }
+            return Poll::Ready(());
         })
     }
 }
 
-async fn handle_socket(socket: &mut TcpSocket<'_>) -> Result<(), Error>{
+fn copy_to_buf(buf: &mut [u8]) -> (usize, bool) {
+    // The socket is ready to send upto buf.len() bytes
+    // Take a critical section while we move bytes out of LOG_BUFFER
+    critical_section::with(|_| unsafe {
+        let len = min(buf.len(), LOG_BUFFER.len());
+        for i in 0..len {
+            // Safety: we are in a critical section, and checked the length above
+            buf[i] = LOG_BUFFER.pop_front_unchecked();
+        }
+        (buf.len(), LOG_BUFFER.len() > 0)
+    })
+}
+
+async fn handle_socket(socket: &mut TcpSocket<'_>) -> Result<(), Error> {
+    socket.set_keep_alive(Some(Duration::from_secs(2)));
+
     loop {
-        //log::info!("Waiting for log buffer");
-        let mut log_buf = LogWaitFuture{}.await;
-        //log::info!("have buffer {}", log_buf.len());
+        // This read allows us to detect a connection reset
+        let read = socket.read_with(|buf| (buf.len(), ()));
 
-        while socket.write_with(|buf| {
-                let len = min(buf.len(), log_buf.len());
-                let (buf, _) = buf.split_at_mut(len);
-
-                buf.iter_mut().for_each(|dst| { *dst = log_buf.pop_front().unwrap() });
-                (buf.len(), log_buf.len() > 0)
-            }).await?
-        {}
+        // Block until there are bytes in the log buffer (or connection resets)
+        match select(LogWaitFuture {}, read).await {
+            Either::First(_) => {
+                // Send data in log buffer
+                while socket.write_with(copy_to_buf).await? {}
+            }
+            Either::Second(Err(Error::ConnectionReset)) => {
+                // The read failed, the connection has reset
+                return Ok(());
+            }
+            Either::Second(Ok(_)) => {
+                defmt::error!("LogDrain: unexpected message");
+            }
+        };
     }
 }
 
-
-async fn broadcast(stack: &'static Stack<cyw43::NetDriver<'static>>, rx_buffer: &mut [u8], tx_buffer: &mut [u8]) {
+async fn broadcast<D: Driver>(stack: &'static Stack<D>, rx_buffer: &mut [u8], tx_buffer: &mut [u8]) {
     let address = loop {
         match stack.config_v4() {
             Some(config) => break config.address,
@@ -107,13 +136,7 @@ async fn broadcast(stack: &'static Stack<cyw43::NetDriver<'static>>, rx_buffer: 
         4301,
     );
 
-    let mut socket = UdpSocket::new(
-        stack,
-        &mut rx_meta,
-        rx_buffer,
-        &mut tx_meta,
-        tx_buffer,
-    );
+    let mut socket = UdpSocket::new(stack, &mut rx_meta, rx_buffer, &mut tx_meta, tx_buffer);
     socket.bind(4300).unwrap();
     socket.send_to(b"hello", broadcast_endpoint).await.ok();
 
@@ -123,8 +146,7 @@ async fn broadcast(stack: &'static Stack<cyw43::NetDriver<'static>>, rx_buffer: 
     socket.close();
 }
 
-#[embassy_executor::task]
-pub async fn log_drain(stack: &'static Stack<cyw43::NetDriver<'static>>) {
+pub async fn log_drain<D: Driver>(stack: &'static Stack<D>) -> ! {
     let tx_buffer = make_static!([0; 0x100]);
     let rx_buffer = make_static!([0; 10]);
 

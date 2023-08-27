@@ -70,6 +70,11 @@ async fn net_task(stack: &'static Stack<cyw43::NetDriver<'static>>) -> ! {
     stack.run().await
 }
 
+#[embassy_executor::task]
+async fn log_drain_task(stack: &'static Stack<cyw43::NetDriver<'static>>) -> ! {
+    log_drain(stack).await
+}
+
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
@@ -158,7 +163,7 @@ async fn main(spawner: Spawner) {
     ));
 
     spawner.spawn(net_task(stack)).unwrap();
-    spawner.spawn(log_drain(stack)).unwrap();
+    spawner.spawn(log_drain_task(stack)).unwrap();
 
     let mut rx_buffer = [0; 0x200];
     let mut tx_buffer = [0; 0x20];
