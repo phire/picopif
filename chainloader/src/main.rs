@@ -9,10 +9,12 @@ mod button;
 mod logger;
 mod build_id;
 mod persistent_ringbuffer;
+mod panic;
 
 
 use defmt::*;
 use logger::*;
+use panic::*;
 
 use cyw43::Control;
 use embassy_executor::Spawner;
@@ -45,11 +47,6 @@ bind_interrupts!(struct Irqs {
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => PioInterruptHandler<PIO0>;
 });
-
-#[cfg(feature = "panic-probe")]
-use panic_probe as _;
-#[cfg(feature = "panic-reset")]
-use panic_reset as _;
 
 #[embassy_executor::task]
 async fn wifi_task(

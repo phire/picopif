@@ -77,9 +77,8 @@ unsafe impl defmt::Logger for Logger {
     }
 
     unsafe fn flush() {
-        // Can't flush without async.
-        // But the presistant ringbuffer allows logs messages to be recovered across resets,
-        // which is almost as good as a flush
+        // Make sure any writes to the persistent ringbuffer have completed
+        cortex_m::asm::dsb();
     }
 
     unsafe fn release() {
