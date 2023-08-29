@@ -3,33 +3,52 @@ use core::{
     future::Future,
     pin::Pin,
     sync::atomic::{AtomicBool, Ordering},
-    task::{Context, Poll},
+    task::{Context, Poll}, ffi::c_void,
 };
 
 use embassy_futures::select::{select, Either};
 use embassy_net::{
+    driver::Driver,
     tcp::{Error, TcpSocket},
     udp::{PacketMetadata, UdpSocket},
-    IpEndpoint, Stack, driver::Driver,
+    IpEndpoint, Stack,
 };
 use embassy_sync::waitqueue::WakerRegistration;
 use embassy_time::{Duration, Timer};
 use static_cell::make_static;
+
+use crate::{build_id, persistent_ringbuffer::PersistentRingBuffer};
 
 static mut CS_RESTORE: critical_section::RestoreState = critical_section::RestoreState::invalid();
 
 // used to detect reentrant calls to global logger
 static TAKEN: AtomicBool = AtomicBool::new(false);
 
-static mut LOG_BUFFER: heapless::Deque<u8, 1024> = heapless::Deque::new();
 static mut WAKER: WakerRegistration = WakerRegistration::new();
 static mut ENCODER: defmt::Encoder = defmt::Encoder::new();
+static mut INITIALIZED: bool = false;
+
+fn get_ringbuffer<'cs>(_: &'cs critical_section::CriticalSection) -> &'cs mut PersistentRingBuffer {
+    unsafe {
+        extern "C" {
+            static mut _log_buffer: PersistentRingBuffer;
+            static _log_buffer_end: c_void;
+        }
+
+        if !INITIALIZED {
+            let build_id = build_id::short_id();
+            let size = (&_log_buffer_end as *const _ as usize) - (&_log_buffer as *const _ as usize);
+            _log_buffer.init(build_id, size);
+            INITIALIZED = true;
+        }
+        &mut _log_buffer
+    }
+}
 
 fn push_bytes(bytes: &[u8]) {
-    unsafe {
-        bytes
-            .into_iter()
-            .try_for_each(|&b| LOG_BUFFER.push_back(b).ok());
+    if TAKEN.load(Ordering::Relaxed) {
+        let cs = unsafe { critical_section::CriticalSection::new() };
+        get_ringbuffer(&cs).push_slice(bytes);
     }
 }
 
@@ -38,22 +57,31 @@ struct Logger;
 
 unsafe impl defmt::Logger for Logger {
     fn acquire() {
+        critical_section::with(|cs| {
+            get_ringbuffer(&cs);
+        });
+
         let restore = unsafe { critical_section::acquire() };
 
         if TAKEN.load(Ordering::Relaxed) {
+            // resetting will hopefully allow us to recover
+            TAKEN.store(false, Ordering::SeqCst);
             panic!("defmt logger taken reentrantly");
         }
 
         TAKEN.store(true, Ordering::Relaxed);
-        unsafe { CS_RESTORE = restore };
         unsafe {
+            CS_RESTORE = restore;
             ENCODER.start_frame(push_bytes);
         }
     }
+
     unsafe fn flush() {
-        // Can't actually flush, as that would require async code
-        // Though, maybe we could force the executor to prioritize the wifi/net tasks?
+        // Can't flush without async.
+        // But the presistant ringbuffer allows logs messages to be recovered across resets,
+        // which is almost as good as a flush
     }
+
     unsafe fn release() {
         ENCODER.end_frame(push_bytes);
         TAKEN.store(false, Ordering::Relaxed);
@@ -61,6 +89,7 @@ unsafe impl defmt::Logger for Logger {
 
         critical_section::release(CS_RESTORE);
     }
+
     unsafe fn write(bytes: &[u8]) {
         ENCODER.write(bytes, push_bytes);
     }
@@ -71,8 +100,8 @@ impl Future for LogWaitFuture {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        critical_section::with(|_| unsafe {
-            if LOG_BUFFER.is_empty() {
+        critical_section::with(|cs| unsafe {
+            if get_ringbuffer(&cs).empty() {
                 WAKER.register(cx.waker());
                 return Poll::Pending;
             }
@@ -84,13 +113,10 @@ impl Future for LogWaitFuture {
 fn copy_to_buf(buf: &mut [u8]) -> (usize, bool) {
     // The socket is ready to send upto buf.len() bytes
     // Take a critical section while we move bytes out of LOG_BUFFER
-    critical_section::with(|_| unsafe {
-        let len = min(buf.len(), LOG_BUFFER.len());
-        for i in 0..len {
-            // Safety: we are in a critical section, and checked the length above
-            buf[i] = LOG_BUFFER.pop_front_unchecked();
-        }
-        (buf.len(), LOG_BUFFER.len() > 0)
+    critical_section::with(|cs| {
+        let rb = get_ringbuffer(&cs);
+        let bytes = rb.pop_to_buf(buf);
+        (bytes, !rb.empty())
     })
 }
 
@@ -118,7 +144,11 @@ async fn handle_socket(socket: &mut TcpSocket<'_>) -> Result<(), Error> {
     }
 }
 
-async fn broadcast<D: Driver>(stack: &'static Stack<D>, rx_buffer: &mut [u8], tx_buffer: &mut [u8]) {
+async fn broadcast<D: Driver>(
+    stack: &'static Stack<D>,
+    rx_buffer: &mut [u8],
+    tx_buffer: &mut [u8],
+) {
     let address = loop {
         match stack.config_v4() {
             Some(config) => break config.address,
@@ -149,6 +179,17 @@ async fn broadcast<D: Driver>(stack: &'static Stack<D>, rx_buffer: &mut [u8], tx
 pub async fn log_drain<D: Driver>(stack: &'static Stack<D>) -> ! {
     let tx_buffer = make_static!([0; 0x100]);
     let rx_buffer = make_static!([0; 10]);
+
+    defmt::info!("LogDrain: starting for build {:08x}", build_id::short_id());
+
+    let (persisted, id) = critical_section::with(|cs| {
+        let rs = get_ringbuffer(&cs);
+        (rs.persisted(), rs.id())
+    });
+
+    if persisted > 0 {
+        defmt::info!("LogDrain: {} bytes from {:08x} persisted across reset", persisted, id);
+    }
 
     loop {
         broadcast(stack, rx_buffer, tx_buffer).await;
