@@ -21,7 +21,6 @@ impl PersistentRingBuffer {
         self.magic == MAGIC
             && self.write < self.capacity
             && self.read < self.capacity
-            && self.persisted == 0
     }
 
     /// Safety: total_size must be correct
@@ -130,4 +129,18 @@ impl PersistentRingBuffer {
         }
         return len;
     }
+
+    /// Get the current write pointer
+    pub fn get_write_ptr(&self) -> usize {
+        self.write
+    }
+
+    /// Erase upto pointer, returns number of bytes erased
+    pub fn erase_to(&mut self, ptr: usize) -> usize {
+        let before_len = self.len();
+        self.read = ptr;
+        self.full = false;
+        return before_len - self.len();
+    }
+
 }

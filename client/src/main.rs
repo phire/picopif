@@ -1,170 +1,158 @@
-use anyhow::anyhow;
+use anyhow::{anyhow, Context};
+use decoder_cache::DecoderCache;
 use log::*;
-use ouroboros::self_referencing;
 use std::{
-    collections::BTreeMap,
     env, fs,
-    io::Read,
+    io::{Read, Write},
     net::{SocketAddr, TcpStream, UdpSocket},
     path::PathBuf,
-    time::Duration,
+    time::Duration, sync::{Mutex, mpsc, OnceLock, MutexGuard},
 };
 
-use defmt_decoder::{
-    DecodeError, Frame, Location, StreamDecoder, Table,
-};
+use clap::Parser;
 
-struct DecoderInner<'a> {
-    decoder: Box<dyn StreamDecoder + 'a>,
-    locs: Option<BTreeMap<u64, Location>>,
-    can_recover: bool,
-    current_dir: PathBuf,
-}
+mod decoder_cache;
 
-#[self_referencing]
-struct Decoder {
-    table: Table,
-    #[borrows(mut table)]
-    #[covariant]
-    inner: DecoderInner<'this>,
-}
+fn find_endpoint() -> anyhow::Result<(TcpStream, SocketAddr)> {
+    let socket = UdpSocket::bind("0.0.0.0:4301")?;
+    let mut buf = [0u8; 1024];
 
-impl Decoder {
-    fn location_info(
-        locs: &Option<BTreeMap<u64, Location>>,
-        frame: &Frame,
-        current_dir: &PathBuf,
-    ) -> (Option<String>, Option<u32>, Option<String>) {
-        let (mut file, mut line, mut mod_path) = (None, None, None);
-
-        let loc = locs.as_ref().and_then(|locs| locs.get(&frame.index()));
-
-        if let Some(loc) = loc {
-            // try to get the relative path, else the full one
-            let path = loc.file.strip_prefix(current_dir).unwrap_or(&loc.file);
-
-            file = Some(path.display().to_string());
-            line = Some(loc.line as u32);
-            mod_path = Some(loc.module.clone());
-        }
-
-        (file, line, mod_path)
-    }
-
-    fn received(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
-        self.with_inner_mut(|inner| {
-            inner.decoder.received(bytes);
-            Self::decode_loop(inner)
-        })
-    }
-
-    fn decode_loop(inner: &mut DecoderInner) -> anyhow::Result<()> {
-        loop {
-            match inner.decoder.decode() {
-                Ok(frame) => {
-                    let (file, line, mod_path) =
-                        Self::location_info(&inner.locs, &frame, &inner.current_dir);
-                    defmt_decoder::log::log_defmt(
-                        &frame,
-                        file.as_deref(),
-                        line,
-                        mod_path.as_deref(),
-                    );
-                }
-                Err(DecodeError::UnexpectedEof) => return Ok(()),
-                Err(DecodeError::Malformed) if inner.can_recover => {
-                    // if recovery is possible, skip the current frame and continue with new data
-                    println!("(HOST) malformed frame skipped");
-                    println!("└─ {} @ {}:{}", env!("CARGO_PKG_NAME"), file!(), line!());
-                    continue;
-                }
-                Err(DecodeError::Malformed) => return Err(DecodeError::Malformed.into()), // Otherwise, abort
+    //info!("Waiting for chainloader broadcast");
+    loop {
+        let (len, address) = socket.recv_from(buf.as_mut())?;
+        let s = String::from_utf8_lossy(&buf[..len]).to_string();
+        if s == "hello" {
+            let timeout = Duration::from_secs(1);
+            if let Ok(stream) = TcpStream::connect_timeout(&address, timeout) {
+                info!("Found chainloader at {}", address);
+                return Ok((stream, address));
             }
         }
     }
 }
 
-fn new_stream_decoder(elf_path: PathBuf) -> anyhow::Result<Decoder> {
-    let bytes = fs::read(elf_path)?;
-    let table = Table::parse(&bytes)?.ok_or_else(|| anyhow!(".defmt data not found"))?;
-    log::info!("Encoding: {:?}", table.encoding());
+struct KillableStream {
+    stream: TcpStream,
+    kill: mpsc::Receiver<()>,
+}
 
-    DecoderTryBuilder {
-        table,
-        inner_builder: |table| {
-            let locs = table.get_locations(&bytes)?;
-            let locs = if table.indices().all(|idx| locs.contains_key(&(idx as u64))) {
-                Some(locs)
-            } else {
-                warn!("location info is incomplete; it will be omitted");
-                None
+impl KillableStream {
+    fn new(stream: TcpStream, kill: mpsc::Receiver<()>) -> KillableStream {
+        stream.set_read_timeout(Some(Duration::from_millis(1250))).unwrap();
+
+        KillableStream { stream, kill }
+    }
+
+    fn read_exact(&mut self, buf: &mut [u8]) -> anyhow::Result<()> {
+        loop {
+            return match self.stream.read_exact(buf) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if !self.kill .try_recv().is_ok() {
+                        continue;
+                    }
+                    Err(anyhow!("log thread killed"))
+                }
+                Err(e) => {
+                    warn!("read error: {}", e);
+                    Err(e.into())
+                }
             };
-            let decoder = table.new_stream_decoder();
-
-            Ok(DecoderInner {
-                locs,
-                can_recover: table.encoding().can_recover(),
-                decoder,
-                current_dir: std::env::current_dir()?,
-            })
-        },
-    }
-    .try_build()
-    .into()
-}
-
-fn find_chainloader() -> anyhow::Result<SocketAddr> {
-    let socket = UdpSocket::bind("0.0.0.0:4301")?;
-    let mut buf = [0u8; 1024];
-
-    info!("Waiting for chainloader broadcast");
-    loop {
-        let (len, address) = socket.recv_from(buf.as_mut())?;
-        let s = String::from_utf8_lossy(&buf[..len]).to_string();
-        if s == "hello" {
-            info!("Found chainloader at {}", address);
-            return Ok(address);
         }
     }
 }
 
-fn handle_chainloader(mut stream: TcpStream, decoder: &mut Decoder) -> anyhow::Result<()> {
-    let mut buf = [0u8; 1500];
-
+fn handle_logstream(mut stream: KillableStream, addr: SocketAddr) -> anyhow::Result<()> {
+    let mut buf = [0u8; 4096];
+    let mut current_id = 0;
     loop {
-        let bytes = stream.read(&mut buf)?;
+        // Header: 12 bytes of MAGIC, ID, BYTES
+        let mut header = [0; 12];
+        stream.read_exact(header.as_mut_slice())?;
 
-        if bytes == 0 {
-            return Ok(());
+        if &header[0..4] != b"LOGS".as_slice() {
+            anyhow::bail!("invalid header {:x?}, {:x?}", header, b"LOGS".as_slice());
+        }
+        let id = u32::from_le_bytes(header[4..8].try_into().unwrap());
+        let bytes = u32::from_le_bytes(header[8..12].try_into().unwrap()) as usize;
+        anyhow::ensure!(bytes <= buf.len(), "invalid bytes {}", bytes);
+
+        if current_id != id {
+            info!("Starting log stream for {:x} at {}", id, addr);
+            current_id = id;
         }
 
-        decoder.received(&buf[..bytes])?;
+        // Body
+        stream.read_exact(&mut buf[..bytes])?;
+
+        // Footer, single u32 of dropped bytes
+        let mut footer = [0; 4];
+        stream.read_exact(&mut footer)?;
+        let dropped = u32::from_le_bytes(footer);
+
+        let valid_bytes = bytes - dropped as usize;
+
+        let mut decoders = lock_decoders();
+        let decoder = decoders.get(id)?;
+
+        if let Err(e) = decoder.decode(&buf[..valid_bytes]) {
+            warn!("decode error: {}", e);
+        }
     }
 }
 
-fn should_log(metadata: &Metadata) -> bool {
+fn should_log(_metadata: &Metadata) -> bool {
     //defmt_decoder::log::is_defmt_frame(metadata)
     true
+}
+
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about)]
+struct Args {
+    app: Option<PathBuf>
+}
+
+static ARGS : OnceLock<Args> = OnceLock::new();
+static DECODERS : OnceLock<Mutex<DecoderCache>> = OnceLock::new();
+
+fn lock_decoders<'a>() -> MutexGuard<'a, DecoderCache> {
+    DECODERS.get_or_init(|| Mutex::new(DecoderCache::new())).lock().unwrap()
+}
+
+fn add_path(path: &PathBuf) -> anyhow::Result<()> {
+    lock_decoders().add_path(path.clone()).with_context(|| format!("Adding {} to decoder cache", path.display()))
 }
 
 fn main() -> anyhow::Result<()> {
     defmt_decoder::log::init_logger(None, None, false, should_log);
 
-    let mut loader_decoder =
-        new_stream_decoder("target/thumbv6m-none-eabi/release/chainloader".into())?;
+    ARGS.set(Args::parse()).unwrap();
 
+    let chainloader_path = env::var("CHAINLOADER_PATH").map(|p| p.into()).unwrap_or("target/thumbv6m-none-eabi/release/chainloader".into());
+
+    add_path(&chainloader_path)?;
+    if let Some(path) = ARGS.get().unwrap().app.as_ref() {
+        add_path(path)?;
+    }
+
+    let mut log_join: Option<(mpsc::Sender<()>, std::thread::JoinHandle<()>)> = None;
     loop {
-        let addr = find_chainloader()?;
-        let timeout = Duration::from_secs(1);
+        let (stream, addr) = find_endpoint()?;
+        info!("Connected");
 
-        match std::net::TcpStream::connect_timeout(&addr, timeout) {
-            Ok(stream) => {
-                info!("Connected");
-                if let Err(e) = handle_chainloader(stream, &mut loader_decoder) {
-                    warn!("Disconnected with {}", e);
-                }
-            }
-            Err(e) => warn!("Connect timeout: {}", e),
+        if let Some((kill, join)) = log_join.take() {
+            //info!("Killing old log thread");
+            kill.send(())?;
+            let _ = join.join().unwrap();
         }
+
+        let (tx, rx) = mpsc::channel();
+        let join = std::thread::spawn(move || {
+            if let Err(e) = handle_logstream(KillableStream::new(stream, rx), addr) {
+                warn!("log disconnected: {}", e);
+            }
+        });
+
+        log_join = Some((tx, join));
     }
 }

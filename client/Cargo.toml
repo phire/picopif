@@ -8,3 +8,5 @@ defmt-decoder = { version = "0.3.8", features = ["unstable"] }
 anyhow = "1"
 log = "0.4.20"
 ouroboros = "0.17.2"
+clap = { version =  "4.0", features = ["derive"] }
+elf = "0.7.2"

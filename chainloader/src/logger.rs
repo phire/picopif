@@ -1,20 +1,21 @@
 use core::{
-    cmp::min,
     future::Future,
     pin::Pin,
     sync::atomic::{AtomicBool, Ordering},
     task::{Context, Poll}, ffi::c_void,
 };
 
+use defmt::*;
 use embassy_futures::select::{select, Either};
 use embassy_net::{
     driver::Driver,
-    tcp::{Error, TcpSocket},
+    tcp::TcpSocket,
     udp::{PacketMetadata, UdpSocket},
     IpEndpoint, Stack,
 };
 use embassy_sync::waitqueue::WakerRegistration;
 use embassy_time::{Duration, Timer};
+use embedded_io_async::{Write, WriteAllError};
 use static_cell::make_static;
 
 use crate::{build_id, persistent_ringbuffer::PersistentRingBuffer};
@@ -27,6 +28,8 @@ static TAKEN: AtomicBool = AtomicBool::new(false);
 static mut WAKER: WakerRegistration = WakerRegistration::new();
 static mut ENCODER: defmt::Encoder = defmt::Encoder::new();
 static mut INITIALIZED: bool = false;
+static mut DROPPED: usize = 0;
+static mut FRAME_START: usize = 0;
 
 fn get_ringbuffer<'cs>(_: &'cs critical_section::CriticalSection) -> &'cs mut PersistentRingBuffer {
     unsafe {
@@ -48,7 +51,14 @@ fn get_ringbuffer<'cs>(_: &'cs critical_section::CriticalSection) -> &'cs mut Pe
 fn push_bytes(bytes: &[u8]) {
     if TAKEN.load(Ordering::Relaxed) {
         let cs = unsafe { critical_section::CriticalSection::new() };
-        get_ringbuffer(&cs).push_slice(bytes);
+        let ringbuffer = get_ringbuffer(&cs);
+        if !ringbuffer.push_slice(bytes) {
+            // The ringbuffer is full, clear everything upto FRAME_START
+            unsafe {
+                DROPPED += ringbuffer.erase_to(FRAME_START);
+            }
+            ringbuffer.push_slice(bytes); // try again
+        }
     }
 }
 
@@ -64,14 +74,17 @@ unsafe impl defmt::Logger for Logger {
         let restore = unsafe { critical_section::acquire() };
 
         if TAKEN.load(Ordering::Relaxed) {
-            // resetting will hopefully allow us to recover
+            // resetting will hopefully allow us print the panic message
             TAKEN.store(false, Ordering::SeqCst);
-            panic!("defmt logger taken reentrantly");
+            core::panic!("defmt logger taken reentrantly");
         }
 
         TAKEN.store(true, Ordering::Relaxed);
         unsafe {
             CS_RESTORE = restore;
+            let cs = critical_section::CriticalSection::new();
+            // store the frame start so we can erase everything but the current frame on overflow
+            FRAME_START = get_ringbuffer(&cs).get_write_ptr();
             ENCODER.start_frame(push_bytes);
         }
     }
@@ -96,31 +109,94 @@ unsafe impl defmt::Logger for Logger {
 
 struct LogWaitFuture;
 impl Future for LogWaitFuture {
-    type Output = ();
+    type Output = usize;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        critical_section::with(|cs| unsafe {
+        critical_section::with(|cs| {
+            unsafe {
+                if DROPPED != 0 {
+                    defmt::error!("LogDrain: dropped {} bytes", DROPPED);
+                    DROPPED = 0;
+                }
+            }
             if get_ringbuffer(&cs).empty() {
-                WAKER.register(cx.waker());
+                unsafe { WAKER.register(cx.waker());}
                 return Poll::Pending;
             }
-            return Poll::Ready(());
+            return Poll::Ready(get_ringbuffer(&cs).len());
         })
     }
 }
 
-fn copy_to_buf(buf: &mut [u8]) -> (usize, bool) {
-    // The socket is ready to send upto buf.len() bytes
-    // Take a critical section while we move bytes out of LOG_BUFFER
-    critical_section::with(|cs| {
-        let rb = get_ringbuffer(&cs);
-        let bytes = rb.pop_to_buf(buf);
-        (bytes, !rb.empty())
-    })
+async fn send_chunk(socket: &mut TcpSocket<'_>, mut bytes: usize, id: u32) -> Result<(), Error> {
+    // Header: 12 bytes of MAGIC, ID, BYTES
+    let mut header = [0; 12];
+    header[0..4].copy_from_slice(b"LOGS");
+    header[4..8].copy_from_slice(&id.to_le_bytes());
+    header[8..12].copy_from_slice(&bytes.to_le_bytes());
+    socket.write_all(&header).await?;
+
+    let mut dropped = 0;
+
+    // Body
+    while bytes > 0 {
+        socket.write_with(|buf| {
+            let len = buf.len().min(bytes);
+            critical_section::with(|cs| {
+                if unsafe { DROPPED == 0 } {
+                    get_ringbuffer(&cs).pop_to_buf(&mut buf[..len]);
+                } else {
+                    dropped += len;
+                    buf[..len].fill(0xff);
+                }
+                bytes -= len;
+                (len, ())
+            })
+        }).await?;
+    }
+
+    if dropped != 0 {
+        defmt::error!("{} bytes dropped while sending chunk", dropped);
+        critical_section::with(|_| unsafe { DROPPED -= dropped; });
+    }
+
+    // Footer
+    socket.write_all(&dropped.to_le_bytes()).await?;
+
+    Ok(())
 }
 
 async fn handle_socket(socket: &mut TcpSocket<'_>) -> Result<(), Error> {
     socket.set_keep_alive(Some(Duration::from_secs(2)));
+    let id = build_id::short_id();
+
+    let persisted = critical_section::with(|cs| {
+        let rb = get_ringbuffer(&cs);
+        let persisted = rb.persisted();
+        let mut invalidated = unsafe { DROPPED };
+        if invalidated == 0 {
+            if persisted != 0 {
+                defmt::println!("LogDrain: {} bytes from {:08x} persisted across reset", persisted, rb.id());
+                Some((persisted, rb.id()))
+            } else {
+                None
+            }
+        } else {
+            if persisted != 0 {
+                defmt::error!("LogDrain: dropped {} bytes from {:08x} ", persisted, rb.id());
+                invalidated -= persisted;
+                rb.reset_presisted(id);
+            }
+            defmt::error!("LogDrain: dropped {} bytes before connecting", invalidated);
+            unsafe { DROPPED = 0 };
+            None
+        }
+    });
+
+    if let Some((bytes, prev_id)) = persisted {
+        send_chunk(socket, bytes, prev_id).await?;
+        critical_section::with(|cs| get_ringbuffer(&cs).reset_presisted(id));
+    }
 
     loop {
         // This read allows us to detect a connection reset
@@ -128,12 +204,12 @@ async fn handle_socket(socket: &mut TcpSocket<'_>) -> Result<(), Error> {
 
         // Block until there are bytes in the log buffer (or connection resets)
         match select(LogWaitFuture {}, read).await {
-            Either::First(_) => {
-                // Send data in log buffer
-                while socket.write_with(copy_to_buf).await? {}
+            Either::First(bytes) => {
+                send_chunk(socket, bytes, id).await?;
             }
-            Either::Second(Err(Error::ConnectionReset)) => {
+            Either::Second(Err(embassy_net::tcp::Error::ConnectionReset)) => {
                 // The read failed, the connection has reset
+                defmt::println!("LogDrain: connection reset");
                 return Ok(());
             }
             Either::Second(Ok(_)) => {
@@ -180,15 +256,8 @@ pub async fn log_drain<D: Driver>(stack: &'static Stack<D>) -> ! {
     let rx_buffer = make_static!([0; 10]);
 
     defmt::info!("LogDrain: starting for build {:08x}", build_id::short_id());
-
-    let (persisted, id) = critical_section::with(|cs| {
-        let rs = get_ringbuffer(&cs);
-        (rs.persisted(), rs.id())
-    });
-
-    if persisted > 0 {
-        defmt::info!("LogDrain: {} bytes from {:08x} persisted across reset", persisted, id);
-    }
+    //log::info!("LogDrain: starting for build {:08x}", build_id::short_id());
+    //log::info!("Log len: {}", critical_section::with(|cs| get_ringbuffer(&cs).len()));
 
     loop {
         broadcast(stack, rx_buffer, tx_buffer).await;
@@ -213,5 +282,22 @@ pub async fn log_drain<D: Driver>(stack: &'static Stack<D>) -> ! {
                 socket.abort();
             }
         }
+    }
+}
+
+#[derive(defmt::Format)]
+enum Error {
+    ConnectionReset,
+}
+
+impl From<embassy_net::tcp::Error> for Error {
+    fn from(_: embassy_net::tcp::Error) -> Self {
+        Error::ConnectionReset
+    }
+}
+
+impl From<WriteAllError<embassy_net::tcp::Error>> for Error {
+    fn from(_: WriteAllError<embassy_net::tcp::Error>) -> Self {
+        Error::ConnectionReset
     }
 }

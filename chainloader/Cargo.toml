@@ -63,5 +63,4 @@ defmt = [
     "embassy-net/defmt",
     "embassy-sync/defmt",
     "embassy-futures/defmt",
-    "panic-reset"
 ]

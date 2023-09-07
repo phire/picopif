@@ -13,11 +13,10 @@ MEMORY
 }
 
 SECTIONS {
-  .logs (NOLOAD) : ALIGN(4)
-  {
-    PROVIDE(_log_buffer = .);
-    /* Consume remaining shared ram */
-    . = ORIGIN(SHARED_RAM) + LENGTH(SHARED_RAM);
-    PROVIDE(_log_buffer_end = .);
-  } > SHARED_RAM
+  . = ORIGIN(SHARED_RAM);
+  PROVIDE(_log_buffer = .);
+
+  /* Consume remaining shared ram */
+  . = ORIGIN(SHARED_RAM) + LENGTH(SHARED_RAM);
+  PROVIDE(_log_buffer_end = .);
 }
