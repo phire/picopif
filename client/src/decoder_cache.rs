@@ -32,6 +32,81 @@ pub fn short_id(full_id: &[u8]) -> u32 {
     id ^ u32::from_le_bytes(bytes)
 }
 
+/// Calculate flash/ram usage and print it out
+fn print_info(file: &ElfBytes<AnyEndian>, elf_path: &PathBuf, id: u32) {
+    let mut text = 0;
+    let mut ram_text = 0;
+    let mut rodata = 0;
+    let mut data = 0;
+    let mut bss = 0;
+
+    for phdr in file.segments().unwrap() {
+        if phdr.p_type == elf::abi::PT_LOAD {
+            let size = phdr.p_memsz;
+
+            if phdr.p_filesz == 0 {
+                bss += size;
+            } else if phdr.p_flags & elf::abi::PF_X != 0 {
+                if phdr.p_vaddr == phdr.p_paddr {
+                    text += size;
+                } else {
+                    ram_text += size;
+                }
+            } else if phdr.p_flags & elf::abi::PF_W != 0 {
+                data += phdr.p_memsz;
+            } else {
+                rodata += phdr.p_memsz;
+            }
+        }
+    }
+
+    let elf_name = elf_path.file_name().unwrap().to_str().unwrap();
+
+    let flash = bytesize::to_string(((text + rodata + data + ram_text + 255) / 256) * 256, false);
+    let ram = bytesize::to_string(ram_text + data + bss, false);
+    let total = bytesize::to_string(text + rodata + data + ram_text + bss, false);
+
+
+    let text = bytesize::to_string(text, false);
+    let ram_text = bytesize::to_string(ram_text, false);
+    let rodata = bytesize::to_string(rodata, false);
+    let data = bytesize::to_string(data, false);
+    let bss = bytesize::to_string(bss, false);
+
+    println!("
+loaded {elf_name} ({id:08x}):
+    text: {text}
+    rodata: {rodata}
+    ram_text: {ram_text}
+    data: {data}
+    bss: {bss}
+    -----------------
+    total: {total}  ({flash} flash, {ram} ram)\n");
+
+}
+
+fn parse_elf(elf_path: &PathBuf) -> anyhow::Result<(u32, Decoder)> {
+    let bytes = fs::read(elf_path)?;
+    let file = ElfBytes::<AnyEndian>::minimal_parse(bytes.as_slice())?;
+
+    let notes_shdr: SectionHeader = file
+        .section_header_by_name(".rodata.gnu_build_id")?
+        .ok_or_else(|| anyhow!("no .rodata.gnu_build_id section"))?;
+
+    let notes: Vec<Note<'_>> = file.section_data_as_notes(&notes_shdr)?.collect();
+    let id;
+    if let Note::GnuBuildId(gnu_id) = notes[0] {
+        id = short_id(gnu_id.0);
+    } else {
+        anyhow::bail!("no build id found")
+    }
+
+    print_info(&file, elf_path, id);
+
+    let decoder = decoder_from(bytes.as_slice())?;
+    Ok((id, decoder))
+}
+
 
 impl DecoderCache {
     pub fn new() -> DecoderCache {
@@ -42,7 +117,7 @@ impl DecoderCache {
     }
 
     pub fn add_path(&mut self, elf_path: PathBuf) -> anyhow::Result<()> {
-        let (id, decoder) = Self::parse_elf(&elf_path)?;
+        let (id, decoder) = parse_elf(&elf_path)?;
 
         let modified = fs::metadata(&elf_path)?.modified()?;
         self.paths.insert(elf_path, modified);
@@ -51,37 +126,11 @@ impl DecoderCache {
         Ok(())
     }
 
-    fn parse_elf(elf_path: &PathBuf) -> anyhow::Result<(u32, Decoder)> {
-        let bytes = fs::read(elf_path)?;
-        let file = ElfBytes::<AnyEndian>::minimal_parse(bytes.as_slice())?;
-
-        //let (section_headers, strtbl) = file.section_headers_with_strtab().unwrap();
-
-        let notes_shdr: SectionHeader = file
-            .section_header_by_name(".rodata.gnu_build_id")?
-            .ok_or_else(|| anyhow!("no .rodata.gnu_build_id section"))?;
-
-        let notes: Vec<Note<'_>> = file.section_data_as_notes(&notes_shdr)?.collect();
-        let id;
-
-        println!("notes: {:?}", notes);
-        if let Note::GnuBuildId(gnu_id) = notes[0] {
-            println!("gnu_id: {:x?}", gnu_id);
-            id = short_id(gnu_id.0);
-            println!("short_id: {:x}", id);
-        } else {
-            anyhow::bail!("no build id found")
-        }
-
-        let decoder = decoder_from(bytes.as_slice())?;
-        Ok((id, decoder))
-    }
-
     fn rescan_paths(&mut self) -> anyhow::Result<()> {
         for (path, modified) in self.paths.iter_mut() {
             let new_modified = fs::metadata(path)?.modified()?;
             if modified != &new_modified {
-                let (new_id, decoder) = Self::parse_elf(path)?;
+                let (new_id, decoder) = parse_elf(path)?;
 
                 *modified = new_modified;
                 self.decoders.insert(new_id, decoder);
