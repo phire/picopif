@@ -6,15 +6,9 @@
 #![feature(generic_const_exprs)]
 
 mod button;
-mod logger;
-mod build_id;
-mod persistent_ringbuffer;
-mod panic;
 
 
 use defmt::*;
-use logger::*;
-use panic::*;
 
 use cyw43::Control;
 use embassy_executor::Spawner;
@@ -72,14 +66,14 @@ async fn net_task(stack: &'static Stack<cyw43::NetDriver<'static>>) -> ! {
 
 #[embassy_executor::task]
 async fn log_drain_task(stack: &'static Stack<cyw43::NetDriver<'static>>) -> ! {
-    log_drain(stack).await
+    net_logger::log_drain(stack).await
 }
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
 
-    info!("Booting chainloader ({:08x})", build_id::short_id());
+    info!("Booting chainloader ({:08x})", net_logger::short_id());
 
     #[cfg(feature = "usb_log")]
     {
