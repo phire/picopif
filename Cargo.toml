@@ -2,8 +2,7 @@ cargo-features = ["per-package-target"]
 
 [workspace]
 members = [
-    "chainloader",
-    "chainload-app",
+    "picopif",
     "client",
 ]
 #default-members = ["client"]

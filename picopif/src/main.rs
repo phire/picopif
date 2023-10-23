@@ -6,13 +6,10 @@
 #![feature(generic_const_exprs)]
 
 mod button;
-mod elf;
 
 use core::cmp::min;
 
 use defmt::*;
-use elf::LoadError;
-use embedded_storage_async::nor_flash::NorFlash;
 
 use cyw43::Control;
 use cyw43_pio::PioSpi;
@@ -23,7 +20,6 @@ use embassy_rp::bind_interrupts;
 use embassy_rp::gpio::{Level, Output};
 use embassy_rp::peripherals::*;
 use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
-use embassy_rp::flash::Flash;
 #[cfg(feature = "usb_log")]
 use embassy_rp::usb::{Driver, InterruptHandler as UsbInterruptHandler};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
@@ -90,7 +86,7 @@ async fn ping_task() -> ! {
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
 
-    info!("Booting chainloader ({:08x})", net_logger::short_id());
+    info!("Booting picopif ({:08x})", net_logger::short_id());
 
     #[cfg(feature = "usb_log")]
     {
@@ -180,8 +176,6 @@ async fn main(spawner: Spawner) {
     let mut rx_buffer = [0; 0x200];
     let mut tx_buffer = [0; 0x20];
 
-    let mut flash = Flash::<_, _, {elf::FLASH_SIZE}>::new(p.FLASH, p.DMA_CH1);
-
     loop {
         let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
         socket.set_timeout(Some(Duration::from_secs(10)));
@@ -193,7 +187,7 @@ async fn main(spawner: Spawner) {
         }
         info!("Accepted connection");
 
-        handle_ctrl(&mut socket, &mut flash).await.err().map(|e| warn!("ctrl error: {:?}", e));
+        handle_ctrl(&mut socket).await.err().map(|e| warn!("ctrl error: {:?}", e));
 
         socket.write_all(b"goodbye").await.ok();
         socket.close();
@@ -201,7 +195,19 @@ async fn main(spawner: Spawner) {
     }
 }
 
-async fn handle_ctrl<N: NorFlash>(socket: &mut TcpSocket<'_>, flash: &mut N) -> Result<(), LoadError> {
+#[derive(defmt::Format)]
+pub enum CtrlError {
+    ConnectionReset,
+    UnknownCommand,
+}
+
+impl From<embassy_net::tcp::Error> for CtrlError {
+    fn from(_: embassy_net::tcp::Error) -> Self {
+        CtrlError::ConnectionReset
+    }
+}
+
+async fn handle_ctrl(socket: &mut TcpSocket<'_>) -> Result<(), CtrlError> {
     //socket.write_all("hello there\n").await?;
     let mut buf = [0u8; 0x20];
 
@@ -220,20 +226,13 @@ async fn handle_ctrl<N: NorFlash>(socket: &mut TcpSocket<'_>, flash: &mut N) -> 
                 while count != 0 {
                     let len = min(count, buf.len());
                     let bytes = read.read(&mut buf[..len]).await?;
-                    write.write_all(&buf[..bytes]).await.or(Err(LoadError::ConnectionReset))?;
+                    write.write_all(&buf[..bytes]).await.or(Err(CtrlError::ConnectionReset))?;
                     count -= bytes;
                 }
             }
-            // load elf
-            0xef => {
-                info!("loading elf");
-                let s = elf::TcpStream::new(&mut read);
-                let entry = elf::load_elf(s, flash).await?;
-                info!("elf entry point: 0x{:08x}", entry);
-            }
             cmd => {
                 error!("unknown cmd {}", cmd);
-                return  Err(LoadError::UnknownCommand);
+                return  Err(CtrlError::UnknownCommand);
             }
         }
 
