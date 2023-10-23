@@ -3,13 +3,17 @@ cargo-features = ["per-package-target"]
 [workspace]
 members = [
     "chainloader",
-   # "chainload-app",
+    "chainload-app",
     "client",
 ]
-default-members = ["chainloader"]
+#default-members = ["client"]
 resolver = "2"
 
 [profile.release]
 debug = true
 opt-level = 's'
+codegen-units=1
 lto = true
+
+[profile.dev]
+opt-level = 1

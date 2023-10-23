@@ -1,3 +1,9 @@
 {
-    "rust-analyzer.cargo.target": "thumbv6m-none-eabi"
+    "rust-analyzer.cargo.target": "thumbv6m-none-eabi",
+    "rust-analyzer.checkOnSave.allTargets" : false,
+    "rust-analyzer.cargo.extraEnv" : {
+        "WIFI_NETWORK" : "my_network",
+        "WIFI_PASSWORD" : "my_password",
+        "DEFMT_LOG" : "trace",
+    }
 }

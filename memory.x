@@ -20,3 +20,12 @@ SECTIONS {
   . = ORIGIN(SHARED_RAM) + LENGTH(SHARED_RAM);
   PROVIDE(_log_buffer_end = .);
 }
+
+SECTIONS
+{
+  .rodata.gnu_build_id :
+  {
+    PROVIDE(g_note_build_id = .);
+    *(.note.gnu.build-id)
+  } > FLASH
+} INSERT AFTER .rodata;

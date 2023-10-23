@@ -101,6 +101,32 @@ fn handle_logstream(mut stream: KillableStream, addr: SocketAddr) -> anyhow::Res
     }
 }
 
+fn handle_control(mut stream: TcpStream, app_path: PathBuf) -> anyhow::Result<()> {
+    let mut buf = [0u8; 100];
+
+    info!("testing echo");
+
+    // Test echo
+    stream.write_all(b"\xec\x05hello")?;
+    stream.read_exact(&mut buf[..5])?;
+    info!("Echo: {}", String::from_utf8_lossy(&buf[..5]));
+
+    // Upload elf cmd
+    stream.write_all(b"\xef")?;
+
+    info!("Uploading {:?}", &app_path);
+    let data = fs::read(app_path)?;
+    stream.write_all(data.as_slice())?;
+
+    stream.flush()?;
+    info!("Upload complete");
+    let len = stream.read(&mut buf)?;
+    let s = String::from_utf8_lossy(&buf[..len]).to_string();
+
+    info!("Response: {}", s);
+    Ok(())
+}
+
 fn should_log(_metadata: &Metadata) -> bool {
     //defmt_decoder::log::is_defmt_frame(metadata)
     true
