@@ -7,7 +7,8 @@ use embassy_net::{
     IpEndpoint, Stack,
 };
 use embassy_time::{Duration, Timer};
-use embedded_io_async::{Write, WriteAllError};
+use embedded_io_async::Write;
+
 use static_cell::make_static;
 
 use crate::{logger::{get_ringbuffer, LogWaitFuture, self}, build_id};
@@ -178,8 +179,3 @@ impl From<embassy_net::tcp::Error> for Error {
     }
 }
 
-impl From<WriteAllError<embassy_net::tcp::Error>> for Error {
-    fn from(_: WriteAllError<embassy_net::tcp::Error>) -> Self {
-        Error::ConnectionReset
-    }
-}

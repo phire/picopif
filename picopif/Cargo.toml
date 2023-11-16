@@ -19,25 +19,24 @@ embassy-rp = { path="../embassy/embassy-rp", features=[
     "rom-v2-intrinsics",
     "critical-section-impl",
 ] }
-embassy-usb = { version = "0.1.0", path = "../embassy/embassy-usb" }
-embassy-time = { version = "0.1.2", path = "../embassy/embassy-time", features = ["nightly", "unstable-traits"] }
-embassy-net = { version = "0.1.0", path = "../embassy/embassy-net", features = ["nightly", "tcp", "udp", "dhcpv4", "medium-ethernet"] }
+embassy-usb = {  path = "../embassy/embassy-usb" }
+embassy-time = { path = "../embassy/embassy-time", features = ["nightly", "unstable-traits"] }
+embassy-net = { path = "../embassy/embassy-net", features = ["nightly", "tcp", "udp", "dhcpv4", "medium-ethernet"] }
 embassy-sync = { path = "../embassy/embassy-sync", features = ["nightly"] }
 embassy-futures = { path = "../embassy/embassy-futures" }
 
-cortex-m = { version = "0.7.6", features = ["inline-asm"] }
-cortex-m-rt = "0.7.0"
+cortex-m = { version = "0.7.7", features = ["inline-asm"] }
+cortex-m-rt = "0.7"
 embedded-storage = { version = "0.3" }
 embedded-storage-async = { version = "0.4.0" }
-embedded-io-async = { version = "0.5.0", features = [] }
+embedded-io-async = { version = "0.6.0", features = [] }
 critical-section = "1.1"
 
 # debugging
 defmt = { version= "0.3", features = ["encoding-rzcobs"] }
-
-panic-probe = { version = "0.3", features = ["print-defmt"], optional = true }
-panic-reset = { version = "0.1.1", optional = true }
-embassy-usb-logger = { version = "0.1.0", path = "../embassy/embassy-usb-logger", optional = true }
+#defmt-rtt = "0.4"
+#panic-probe = { version = "0.3", features = ["print-defmt"], optional = true }
+embassy-usb-logger = { path = "../embassy/embassy-usb-logger", optional = true }
 log = { version = "0.4", optional = true }
 
 # wifi
@@ -45,12 +44,18 @@ cyw43 = { path = "../embassy/cyw43", features = [] }
 cyw43-pio = { path = "../embassy/cyw43-pio", features = [] }
 
 static_cell = { version = "1.1", features = ["nightly"]}
-heapless = "0.7.15"
+heapless = "0.7.5"
 
 net-logger = { path = "../net-logger" }
 
 [features]
-default = ["defmt"]
+default = ["defmt", "run-from-ram"]
+run-from-ram = [  # runs from RAM, doesn't include boot2
+    "embassy-rp/run-from-ram",
+    "cortex-m-rt/set-sp",
+    "cortex-m-rt/set-vtor"
+]
+copy-to-ram = ["run-from-ram", "embassy-rp/boot2-ram-memcpy"]
 usb_log = [
     "log",
     "embassy-usb-logger",
@@ -58,6 +63,7 @@ usb_log = [
     "cyw43/firmware-logs",
 ]
 defmt = [
+    #"cyw43/defmt",
     "embassy-executor/defmt",
     "embassy-rp/defmt",
     "embassy-usb/defmt",

@@ -6,14 +6,14 @@ edition = "2021"
 [lib]
 
 [dependencies]
-embassy-net = { version = "0.1.0", path = "../embassy/embassy-net", features = ["nightly", "tcp", "udp", "medium-ethernet", "defmt"] }
+embassy-net = { path = "../embassy/embassy-net", features = ["nightly", "tcp", "udp", "medium-ethernet", "defmt"] }
 embassy-futures = { path = "../embassy/embassy-futures" }
 embassy-sync = { path = "../embassy/embassy-sync", features = ["nightly"] }
-embassy-time = { version = "0.1.2", path = "../embassy/embassy-time", features = ["nightly", "unstable-traits"] }
+embassy-time = { path = "../embassy/embassy-time", features = ["nightly", "unstable-traits"] }
 
 critical-section = "1.1"
-cortex-m = { version = "0.7.6", features = ["inline-asm"] }
-embedded-io-async = { version = "0.5.0", features = [] }
+cortex-m = { version = "0.7.7", features = ["inline-asm"] }
+embedded-io-async = { version = "0.6.0", features = [] }
 static_cell = { version = "1.1", features = ["nightly"]}
 
 defmt = { version= "0.3", features = ["encoding-rzcobs"] }

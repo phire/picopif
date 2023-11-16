@@ -1,11 +1,12 @@
 
 use cyw43::Control;
 
+use embassy_rp::peripherals::BOOTSEL;
 use embassy_sync::{blocking_mutex::raw::NoopRawMutex, mutex::Mutex};
 use embassy_time::{Duration, Timer};
 
 #[embassy_executor::task]
-pub async fn button_task(control_mutex: &'static Mutex::<NoopRawMutex, Control<'static>>) {
+pub async fn button_task(control_mutex: &'static Mutex::<NoopRawMutex, Control<'static>>, mut bootsel: BOOTSEL) {
     assert!(embassy_rp::pac::SIO.cpuid().read() == 0, "Need to be on core 0");
 
     let mut prev_state = false;
@@ -13,7 +14,7 @@ pub async fn button_task(control_mutex: &'static Mutex::<NoopRawMutex, Control<'
     loop {
         Timer::after(Duration::from_millis(32)).await;
 
-        let button_state = embassy_rp::bootsel::poll_bootsel();
+        let button_state = bootsel.is_pressed();
 
         if !prev_state && button_state {
             defmt::info!("Resetting");

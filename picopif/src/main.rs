@@ -1,11 +1,12 @@
 #![no_std]
 #![no_main]
 #![feature(type_alias_impl_trait)]
-#![feature(async_fn_in_trait)]
 #![allow(incomplete_features)]
 #![feature(generic_const_exprs)]
+#![feature(impl_trait_in_fn_trait_return)]
 
 mod button;
+mod wifi_firmware;
 
 use core::cmp::min;
 
@@ -82,11 +83,30 @@ async fn ping_task() -> ! {
     }
 }
 
+#[cortex_m_rt::pre_init]
+unsafe fn pre_init() {
+    // Reset spinlock 31, otherwise critical_section_impl might deadlock on reset
+    core::arch::asm!("
+        ldr r0, =1
+        ldr r1, =0xd000017c
+        str r0, [r1]
+    ");
+}
+
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
-    let p = embassy_rp::init(Default::default());
+    let boot = Instant::now();
+    let mut p = embassy_rp::init(Default::default());
 
-    info!("Booting picopif ({:08x})", net_logger::short_id());
+    println!("Booting picopif ({:08x})", net_logger::short_id());
+
+    #[cfg(feature = "run-from-ram")]
+    {
+        // Enable XIP
+        unsafe { embassy_rp::rom_data::flash_enter_cmd_xip() };
+
+        // TODO: Replace XIP background reads with direct QSPI flash reads.
+    }
 
     #[cfg(feature = "usb_log")]
     {
@@ -100,8 +120,6 @@ async fn main(spawner: Spawner) {
     let control_mutex: &'static Mutex<NoopRawMutex, Control<'static>>;
     let net_device;
     {
-        let fw = include_bytes!("../../embassy/cyw43-firmware/43439A0.bin");
-
         let pwr = Output::new(p.PIN_23, Level::Low);
         let cs = Output::new(p.PIN_25, Level::High);
         let mut pio = Pio::new(p.PIO0, Irqs);
@@ -116,7 +134,8 @@ async fn main(spawner: Spawner) {
         );
 
         let state = make_static!(cyw43::State::new());
-        let (device, control, runner) = cyw43::new(state, pwr, spi, fw).await;
+        let firmware_loader = wifi_firmware::open_firmware(&mut p.FLASH, &mut p.DMA_CH1);
+        let (device, control, runner) = cyw43::new(state, pwr, spi, firmware_loader).await;
         spawner.spawn(wifi_task(runner)).unwrap();
 
         control_mutex = make_static!(Mutex::<NoopRawMutex, _>::new(control));
@@ -124,9 +143,9 @@ async fn main(spawner: Spawner) {
     }
 
     {
-        let clm = include_bytes!("../../embassy/cyw43-firmware/43439A0_clm.bin");
+        let clm_loader = wifi_firmware::open_clm(&mut p.FLASH, &mut p.DMA_CH1);
         let mut control = control_mutex.lock().await;
-        control.init(clm).await;
+        control.init(clm_loader).await;
         control
             .set_power_management(cyw43::PowerManagementMode::None)
             .await;
@@ -134,11 +153,28 @@ async fn main(spawner: Spawner) {
 
     let wifi_init_time = wifi_init.elapsed();
 
-    info!("WiFi init time: {:?}", wifi_init_time);
+    info!("Booted at {} ms, {}", boot.as_millis(), boot.as_ticks() & 0xffff);
+    info!("WiFi init time: {} ms, {}", wifi_init_time.as_millis(), wifi_init_time.as_ticks() & 0xffff);
 
     spawner
-        .spawn(crate::button::button_task(&control_mutex))
+        .spawn(crate::button::button_task(&control_mutex, p.BOOTSEL))
         .unwrap();
+
+    let config = Config::dhcpv4(Default::default());
+    // Use wifi init as seed.
+    // Doesn't need to be cryptographically secure, this seems to give at least a few bits of entropy.
+    let seed = wifi_init_time.as_ticks() & 0xffffffff;
+
+    static STACK_CELL: StaticCell<Stack<cyw43::NetDriver<'static>>> = StaticCell::new();
+    let stack = STACK_CELL.init(Stack::new(
+        net_device,
+        config,
+        make_static!(StackResources::<4>::new()),
+        seed,
+    ));
+
+    // Start network stack before joining wifi. Otherwise the first DHCP seems to timeout.
+    spawner.spawn(net_task(stack)).unwrap();
 
     let wifi_join = Instant::now();
 
@@ -154,23 +190,10 @@ async fn main(spawner: Spawner) {
     }
 
     let wifi_join_time = wifi_join.elapsed();
+    info!("Connected in {} ms", wifi_join_time.as_millis());
 
-    let config = Config::dhcpv4(Default::default());
 
-    // Use wifi init and connection times as a seed.
-    // Doesn't need to be cryptographically secure, this seems to give at least 16 bits of entropy.
-    let seed = (wifi_init_time.as_ticks() & 0xffffffff) * (wifi_join_time.as_ticks() & 0xffffffff);
-
-    static STACK_CELL: StaticCell<Stack<cyw43::NetDriver<'static>>> = StaticCell::new();
-    let stack = STACK_CELL.init(Stack::new(
-        net_device,
-        config,
-        make_static!(StackResources::<4>::new()),
-        seed,
-    ));
-
-    spawner.spawn(ping_task()).unwrap();
-    spawner.spawn(net_task(stack)).unwrap();
+    //spawner.spawn(ping_task()).unwrap();
     spawner.spawn(log_drain_task(stack)).unwrap();
 
     let mut rx_buffer = [0; 0x200];
