@@ -3,9 +3,7 @@ cargo-features = ["per-package-target"]
 [workspace]
 members = [
     "picopif",
-    "client",
 ]
-#default-members = ["client"]
 resolver = "2"
 
 [profile.release]
