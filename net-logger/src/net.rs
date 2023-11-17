@@ -14,7 +14,7 @@ use static_cell::make_static;
 use crate::{logger::{get_ringbuffer, LogWaitFuture, self}, build_id};
 
 pub async fn log_drain<D: Driver>(stack: &'static Stack<D>) -> ! {
-    let tx_buffer = make_static!([0; 0x100]);
+    let tx_buffer = make_static!([0; 1500]);
     let rx_buffer = make_static!([0; 10]);
 
     defmt::info!("LogDrain: starting for build {:08x}", build_id::short_id());

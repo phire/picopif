@@ -1,13 +1,15 @@
 
 
-use core::array::from_fn;
+use core::{array::from_fn, borrow::BorrowMut};
 
-use defmt::println;
+use defmt::{println, error};
+use embassy_futures::yield_now;
 use embassy_time::Instant;
 use pio_proc::pio_file;
 
 use embassy_rp::{pio::{Pio, Config, ShiftDirection, Direction}, peripherals::*, gpio::{SlewRate, Pull, Input, self, Level}, pio_instr_util, Peripheral, dma::Channel};
 use fixed::FixedU32;
+use static_cell::make_static;
 
 use crate::Irqs;
 
@@ -31,6 +33,10 @@ pub async fn sniff2(pio_periph: PIO1, pif_clk: PIN_20, pif_in: PIN_18, pif_out: 
     }
 
 }
+
+const SAMPLES : usize = 1024 * 20;
+const WORDS : usize = (SAMPLES * 3).div_ceil(32);
+static mut DATA: [u32; WORDS] = [0u32; WORDS];
 
 pub async fn sniffer<DMA>(dma: impl Peripheral<P = DMA>, pio_periph: PIO1, pif_clk: PIN_20, pif_in: PIN_18, pif_out: PIN_19) where DMA: Channel {
     let mut pio = Pio::new(pio_periph, Irqs);
@@ -84,8 +90,9 @@ pub async fn sniffer<DMA>(dma: impl Peripheral<P = DMA>, pio_periph: PIO1, pif_c
 
     let mut count = 1;
     defmt::println!("Snifffing {} cycles", count);
-    const SAMPLES : usize = 1024;
-    const WORDS : usize = (SAMPLES * 3).div_ceil(32);
+
+
+
 
     defmt::println!("{} words containing {} samples", WORDS, SAMPLES);
     let mut dma = dma.into_ref();
@@ -95,80 +102,83 @@ pub async fn sniffer<DMA>(dma: impl Peripheral<P = DMA>, pio_periph: PIO1, pif_c
             pio_instr_util::set_y(&mut pio.sm0, SAMPLES as u32);
             pio_instr_util::exec_jmp(&mut pio.sm0, loaded_program.origin)
         }
-        let mut data = [0u32; WORDS];
+        let data_slice = unsafe { &mut DATA[0..] };
 
         pio.sm0.set_enable(true);
-        //let transfer = pio.sm0.rx().dma_pull(dma.reborrow(), &mut data);
-        data[0] = pio.sm0.rx().wait_pull().await;
-        let mut idx = 1;
-        println!("data[0] = {:032b}", data[0]);
-
-        while idx < WORDS {
-            let mut try_read = || {
-                for _ in 0..1024 {
-                    if let Some(val) = pio.sm0.rx().try_pull() {
-                        return Some(val);
-                    }
-                }
-                return None
-            };
-            if let Some(val) = try_read() {
-                data[idx] = val;
-                idx += 1;
-            } else {
-                break;
-            }
-        }
+        pio.sm0.rx().dma_pull(dma.reborrow(), data_slice).await;
 
         let now = Instant::now();
         pio.sm0.set_enable(false);
+
+        if pio.sm0.rx().underflowed() {
+            error!("FIFO underflowed")
+        } else {
+            println!("Successfuly read {} words", data_slice.len());
+        }
+
         let diff = now - prev;
         prev = now;
 
-        let trace = Trace{ len: idx, data };
-        defmt::println!("+{:09}: {}", diff.as_micros() as u32, trace);
+        for i in (0..data_slice.len()).step_by(3) {
+            deinterlace3(&mut data_slice[i..i+3]);
+        }
+
+        defmt::println!("+{:09}", diff.as_micros() as u32);
+        let mut offset = 0;
+
+        for chunk in data_slice.chunks(3 * 6 * 10) {
+            let trace = Trace{ offset, data: chunk };
+            offset += chunk.len();
+            defmt::println!("{}", trace);
+            while !net_logger::is_drained() {
+                yield_now().await;
+            }
+        }
+
         count -= 1;
     }
     pio.sm0.set_enable(false);
     defmt::println!("Sniff Done");
 }
 
-struct Trace<const N: usize> {
-    len: usize,
-    data: [u32; N]
+struct Trace {
+    offset: usize,
+    data: &'static[u32]
 }
 
-fn deinterlace3(out: &mut [u32], mut data: u32) {
-    for _ in 0..10 {
-        out[0] = (out[0] << 1) | ((data >> 27) & 1);
-        out[1] = (out[1] << 1) | ((data >> 28) & 1);
-        out[2] = (out[2] << 1) | ((data >> 29) & 1);
-        data <<=3;
+fn deinterlace3(out: &mut [u32]) {
+    let mut data = out[0];
+    let mut more_data = [out[1], out[2]];
+    out[0] = 0;
+    out[1] = 0;
+    out[2] = 0;
+    for _ in 0..3 {
+        for _ in 0..10 {
+            out[0] = (out[0] << 1) | ((data >> 27) & 1);
+            out[1] = (out[1] << 1) | ((data >> 28) & 1);
+            out[2] = (out[2] << 1) | ((data >> 29) & 1);
+            data <<=3;
+        }
+        data = more_data[0];
+        more_data[0] = more_data[1];
     }
 }
 
-impl<const N: usize> defmt::Format for Trace<N> {
+impl defmt::Format for Trace {
     fn format(&self, f: defmt::Formatter) {
-        let mut out = [0u32; N];
-        //let mut top = 1;
-        for i in (0..self.len).step_by(3) {
-            for j in i..(i+3) {
-                deinterlace3(&mut out[i..], self.data[j]);
-            }
-        }
-        for base in (0..self.len).step_by(6 * 3) {
-            let top = (base + 6 * 3).min(self.len);
-            defmt::write!(f, "\n{}\n  in: ", base*30);
+        for base in (0..self.data.len()).step_by(6 * 3) {
+            let top = (base + 6 * 3).min(self.data.len());
+            defmt::write!(f, "\n{}\n  in: ", (base + self.offset) * 30);
             for i in (base..top).step_by(3) {
-                defmt::write!(f, " {:030b}", out[i]);
+                defmt::write!(f, " {:030b}", self.data[i]);
             }
             defmt::write!(f, "\n  out:");
             for i in (base..top).step_by(3) {
-                defmt::write!(f, " {:030b}", out[i + 1]);
+                defmt::write!(f, " {:030b}", self.data[i + 1]);
             }
             defmt::write!(f, "\n  clk:");
             for i in (base..top).step_by(3) {
-                defmt::write!(f, " {:030b}", out[i + 2]);
+                defmt::write!(f, " {:030b}", self.data[i + 2]);
             }
         }
     }
