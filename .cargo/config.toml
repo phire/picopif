@@ -6,7 +6,7 @@ runner = "probe-rs run --chip RP2040 --protocol swd "
 target = "thumbv6m-none-eabi"
 
 [env]
-DEFMT_LOG = "debug"
+DEFMT_LOG = "info"
 # Override these in $CARGO_HOME/config.toml
 #WIFI_NETWORK = "network"
 #WIFI_PASSWORD = "password"

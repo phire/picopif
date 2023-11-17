@@ -103,6 +103,12 @@ fn push_bytes(bytes: &[u8]) {
     }
 }
 
+pub fn byte_count() -> usize {
+    critical_section::with(|cs| {
+        get_ringbuffer(&cs).len()
+    })
+}
+
 pub struct LogWaitFuture;
 impl Future for LogWaitFuture {
     type Output = usize;

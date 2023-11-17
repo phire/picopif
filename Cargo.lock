@@ -1158,6 +1158,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dd8b5dd2ae5ed71462c540258bedcb51965123ad7e7ccf4b9a8cafaa4a63576d"
 
 [[package]]
+name = "panic-probe"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aa6fa5645ef5a760cd340eaa92af9c1ce131c8c09e7f8926d8a24b59d26652b9"
+dependencies = [
+ "cortex-m",
+ "defmt",
+]
+
+[[package]]
 name = "parking_lot"
 version = "0.11.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1251,9 +1261,13 @@ dependencies = [
  "embedded-io-async",
  "embedded-storage",
  "embedded-storage-async",
+ "fixed",
  "heapless",
  "log",
  "net-logger",
+ "panic-probe",
+ "pio",
+ "pio-proc",
  "static_cell 1.3.0",
 ]
 

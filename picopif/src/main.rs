@@ -6,11 +6,13 @@
 #![feature(impl_trait_in_fn_trait_return)]
 
 mod button;
+mod si;
 mod wifi_firmware;
 
 use core::cmp::min;
 
 use defmt::*;
+//use panic_probe as _;
 
 use cyw43::Control;
 use cyw43_pio::PioSpi;
@@ -37,12 +39,14 @@ const WIFI_PASSWORD: &str = env!("WIFI_PASSWORD");
 #[cfg(feature = "usb_log")]
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => PioInterruptHandler<PIO0>;
+    PIO1_IRQ_0 => PioInterruptHandler<PIO1>;
     USBCTRL_IRQ => UsbInterruptHandler<USB>;
 });
 
 #[cfg(not(feature = "usb_log"))]
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => PioInterruptHandler<PIO0>;
+    PIO1_IRQ_0 => PioInterruptHandler<PIO1>;
 });
 
 #[embassy_executor::task]
@@ -196,26 +200,42 @@ async fn main(spawner: Spawner) {
     //spawner.spawn(ping_task()).unwrap();
     spawner.spawn(log_drain_task(stack)).unwrap();
 
-    let mut rx_buffer = [0; 0x200];
-    let mut tx_buffer = [0; 0x20];
+    info!("Waiting for logs to drain");
+    loop {
+        Timer::after(Duration::from_millis(100)).await;
+        if net_logger::is_drained() {
+            break;
+        }
+    }
+
+    info!("Logs drained, continuing");
+
+    si::sniffer(p.DMA_CH3, p.PIO1, p.PIN_20, p.PIN_18, p.PIN_19).await;
 
     loop {
-        let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
-        socket.set_timeout(Some(Duration::from_secs(10)));
-
-        info!("Listening on port 4303...");
-        if let Err(e) = socket.accept(4303).await {
-            warn!("accept error: {:?}", e);
-            continue;
-        }
-        info!("Accepted connection");
-
-        handle_ctrl(&mut socket).await.err().map(|e| warn!("ctrl error: {:?}", e));
-
-        socket.write_all(b"goodbye").await.ok();
-        socket.close();
-        socket.flush().await.ok();
+        Timer::after(Duration::from_millis(1000)).await;
     }
+
+    // let mut rx_buffer = [0; 0x200];
+    // let mut tx_buffer = [0; 0x20];
+
+    // loop {
+    //     let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
+    //     socket.set_timeout(Some(Duration::from_secs(10)));
+
+    //     info!("Listening on port 4303...");
+    //     if let Err(e) = socket.accept(4303).await {
+    //         warn!("accept error: {:?}", e);
+    //         continue;
+    //     }
+    //     info!("Accepted connection");
+
+    //     handle_ctrl(&mut socket).await.err().map(|e| warn!("ctrl error: {:?}", e));
+
+    //     socket.write_all(b"goodbye").await.ok();
+    //     socket.close();
+    //     socket.flush().await.ok();
+    // }
 }
 
 #[derive(defmt::Format)]
