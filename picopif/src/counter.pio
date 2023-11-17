@@ -1,0 +1,8 @@
+.program counter
+.wrap_target
+count:
+    wait 0 gpio 20
+    ;in x, 32
+    wait 1 gpio 20
+    jmp x--, count
+.wrap

@@ -1,6 +1,6 @@
 
 
-use core::{array::from_fn, borrow::BorrowMut};
+use core::{array::from_fn, borrow::BorrowMut, ops::Neg};
 
 use defmt::{println, error};
 use embassy_futures::yield_now;
@@ -9,33 +9,10 @@ use pio_proc::pio_file;
 
 use embassy_rp::{pio::{Pio, Config, ShiftDirection, Direction}, peripherals::*, gpio::{SlewRate, Pull, Input, self, Level}, pio_instr_util, Peripheral, dma::Channel};
 use fixed::FixedU32;
-use static_cell::make_static;
 
 use crate::Irqs;
 
-
-pub async fn sniff2(pio_periph: PIO1, pif_clk: PIN_20, pif_in: PIN_18, pif_out: PIN_19) {
-    let mut pif_in = Input::new(pif_clk, Pull::None);
-
-    match pif_in.get_level() {
-        Level::Low => println!("pif_in is low"),
-        Level::High => println!("pif_in is high"),
-    }
-
-    loop {
-        pif_in.wait_for_rising_edge().await;
-        let mut val = 0u32;
-        for _ in 0..32 {
-            val = (val << 1) | (pif_in.get_level() as u32);
-        }
-
-        println!("rising edge, pattern: {:032b}", val);
-    }
-
-}
-
-const SAMPLES : usize = 1024 * 20;
-const WORDS : usize = (SAMPLES * 3).div_ceil(32);
+const WORDS : usize = 10000;
 static mut DATA: [u32; WORDS] = [0u32; WORDS];
 
 pub async fn sniffer<DMA>(dma: impl Peripheral<P = DMA>, pio_periph: PIO1, pif_clk: PIN_20, pif_in: PIN_18, pif_out: PIN_19) where DMA: Channel {
@@ -59,20 +36,20 @@ pub async fn sniffer<DMA>(dma: impl Peripheral<P = DMA>, pio_periph: PIO1, pif_c
     pif_out.set_input_sync_bypass(true);
     pif_out.set_slew_rate(SlewRate::Fast);
 
-    let program = pio_file!("src/sniffer.pio");
+    let program = pio_file!("src/sniff_cmd.pio");
+    let counter = pio_file!("src/counter.pio");
 
     let loaded_program = pio.common.load_program(&program.program);
+    let loaded_counter = pio.common.load_program(&counter.program);
 
     let mut cfg_sniff_in = Config::default();
     cfg_sniff_in.use_program(&loaded_program, &[]);
     cfg_sniff_in.set_in_pins(&[&pif_in, &pif_out, &pif_clk]);
     //cfg_sniff_in.set_in_pins(&[&pif_out, &pif_clk]);
     //cfg_sniff_in.set_jmp_pin(&pif_in);
-    cfg_sniff_in.shift_out.direction = ShiftDirection::Left;
-    cfg_sniff_in.shift_out.auto_fill = true;
     cfg_sniff_in.shift_in.direction = ShiftDirection::Left;
-    cfg_sniff_in.shift_in.auto_fill = true;
-    cfg_sniff_in.shift_in.threshold = 30;
+    //cfg_sniff_in.shift_in.auto_fill = true;
+    //cfg_sniff_in.shift_in.threshold = 30;
     cfg_sniff_in.clock_divider = FixedU32::ONE;
 
     // let mut cfg_sniff_out = Config::default();
@@ -84,58 +61,62 @@ pub async fn sniffer<DMA>(dma: impl Peripheral<P = DMA>, pio_periph: PIO1, pif_c
     // cfg_sniff_out.clock_divider = FixedU32::from_bits(0x0200);
 
     pio.sm0.set_config(&cfg_sniff_in);
-    pio.sm0.set_pin_dirs(Direction::In, &[&pif_in, &pif_out, &pif_clk]);
+    pio.sm0.set_enable(true);
+
+    let mut cfg_counter = Config::default();
+    cfg_counter.use_program(&loaded_counter, &[]);
+    cfg_counter.shift_in.auto_fill = true;
+    cfg_counter.clock_divider = FixedU32::ONE;
+    pio.sm1.set_config(&cfg_counter);
+
+    unsafe {
+        pio_instr_util::set_x(&mut pio.sm1, u32::MAX);
+    }
+    pio.sm1.set_enable(true);
 
     let mut prev = Instant::now();
 
-    let mut count = 1;
-    defmt::println!("Snifffing {} cycles", count);
+    let mut count = 0;
+    //defmt::println!("Snifffing {} cycles", count);
 
-
-
-
-    defmt::println!("{} words containing {} samples", WORDS, SAMPLES);
+    //defmt::println!("{} words containing {} samples", WORDS, SAMPLES);
     let mut dma = dma.into_ref();
 
-    while count > 0 {
-        unsafe {
-            pio_instr_util::set_y(&mut pio.sm0, SAMPLES as u32);
-            pio_instr_util::exec_jmp(&mut pio.sm0, loaded_program.origin)
-        }
-        let data_slice = unsafe { &mut DATA[0..] };
+    let prev = 0;
+    let mut stop = u32::MAX;
 
-        pio.sm0.set_enable(true);
-        pio.sm0.rx().dma_pull(dma.reborrow(), data_slice).await;
+    let data_slice = unsafe { &mut DATA[0..] };
+    while count < data_slice.len() {
+        let cmd = match pio.sm0.rx().try_pull() {
+            Some(cmd) => cmd,
+            None => {
+                stop -= 1;
+                if stop < 10 {
+                    break;
+                }
+                continue
+            }
+        };
 
-        let now = Instant::now();
-        pio.sm0.set_enable(false);
+        stop = 1000;
 
-        if pio.sm0.rx().underflowed() {
-            error!("FIFO underflowed")
-        } else {
-            println!("Successfuly read {} words", data_slice.len());
-        }
+        let cycles = (u32::MAX - 5000000) - unsafe { pio_instr_util::get_x(&mut pio.sm1) };
 
-        let diff = now - prev;
-        prev = now;
+        data_slice[count] = cmd << 21 | (cycles & 0x1f_ffff);
+        count += 1;
+    }
 
-        for i in (0..data_slice.len()).step_by(3) {
-            deinterlace3(&mut data_slice[i..i+3]);
-        }
-
-        defmt::println!("+{:09}", diff.as_micros() as u32);
-        let mut offset = 0;
-
-        for chunk in data_slice.chunks(3 * 6 * 10) {
-            let trace = Trace{ offset, data: chunk };
-            offset += chunk.len();
-            defmt::println!("{}", trace);
+    for i in 0..count {
+        let cmd = data_slice[i];
+        let cmd_type = SiCommand::from(cmd >> 30);
+        let addr =  0xbfc0_0000 | ((cmd >> 21 & 0x1ff) << 2);
+        let cycles = cmd & 0x1f_ffff;
+        defmt::println!("{:?} {:08x} @ {}", cmd_type, addr, cycles);
+        if i & 0x3f == 0x3f {
             while !net_logger::is_drained() {
                 yield_now().await;
             }
         }
-
-        count -= 1;
     }
     pio.sm0.set_enable(false);
     defmt::println!("Sniff Done");
@@ -180,6 +161,26 @@ impl defmt::Format for Trace {
             for i in (base..top).step_by(3) {
                 defmt::write!(f, " {:030b}", self.data[i + 2]);
             }
+        }
+    }
+}
+
+#[derive(defmt::Format)]
+enum SiCommand {
+    Write64 = 0,
+    Write4 = 1,
+    Read64 = 2,
+    Read4 = 3,
+}
+
+impl From<u32> for SiCommand {
+    fn from(cmd: u32) -> Self {
+        match cmd {
+            0 => SiCommand::Write64,
+            1 => SiCommand::Write4,
+            2 => SiCommand::Read64,
+            3 => SiCommand::Read4,
+            _ => panic!("Invalid command {}", cmd),
         }
     }
 }
