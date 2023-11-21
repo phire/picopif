@@ -1,168 +1,140 @@
 
 
-use core::{array::from_fn, borrow::BorrowMut, ops::Neg};
-
 use defmt::{println, error};
-use embassy_futures::yield_now;
-use embassy_time::Instant;
+use embassy_futures::{yield_now, select::{select, Either}};
+use embassy_time::{Instant, Duration, Timer};
 use pio_proc::pio_file;
 
-use embassy_rp::{pio::{Pio, Config, ShiftDirection, Direction}, peripherals::*, gpio::{SlewRate, Pull, Input, self, Level}, pio_instr_util, Peripheral, dma::Channel};
+use embassy_rp::{pio::{Pio, Config, ShiftDirection, Direction}, peripherals::*, gpio::{SlewRate, Pull, Input, self, Level, Output}, pio_instr_util, Peripheral, dma::Channel};
 use fixed::FixedU32;
 
 use crate::Irqs;
 
-const WORDS : usize = 10000;
-static mut DATA: [u32; WORDS] = [0u32; WORDS];
+fn clocks(pio: &mut Pio<PIO1>) -> u32 {
+    let x = unsafe { pio_instr_util::get_x(&mut pio.sm1) };
 
-pub async fn sniffer<DMA>(dma: impl Peripheral<P = DMA>, pio_periph: PIO1, pif_clk: PIN_20, pif_in: PIN_18, pif_out: PIN_19) where DMA: Channel {
+    u32::MAX - x
+}
+
+pub async fn sniffer<DMA>(dma: impl Peripheral<P = DMA>, pio_periph: PIO1, pif_clk: PIN_20, pif_in: PIN_18, pif_out: PIN_19, nmi: PIN_21, int2: PIN_22) where DMA: Channel {
     let mut pio = Pio::new(pio_periph, Irqs);
+
+    let mut nmi = Output::new(nmi, Level::Low);
+    let int2 = Output::new(int2, Level::High);
+    let gpio_pif_out = Input::new(unsafe { pif_out.clone_unchecked() }, Pull::None);
+
+    while !net_logger::is_drained() {
+        yield_now().await;
+    }
 
     let mut pif_clk: embassy_rp::pio::Pin<PIO1> = pio.common.make_pio_pin(pif_clk);
     pif_clk.set_pull(Pull::None);
     pif_clk.set_schmitt(true);
-    pif_clk.set_input_sync_bypass(true);
-    pif_clk.set_slew_rate(SlewRate::Fast);
 
     let mut pif_in: embassy_rp::pio::Pin<PIO1> = pio.common.make_pio_pin(pif_in);
     pif_in.set_pull(Pull::None);
     pif_in.set_schmitt(true);
-    pif_in.set_input_sync_bypass(true);
-    pif_in.set_slew_rate(SlewRate::Fast);
 
     let mut pif_out: embassy_rp::pio::Pin<PIO1> = pio.common.make_pio_pin(pif_out);
-    pif_out.set_pull(Pull::None);
-    pif_out.set_schmitt(true);
-    pif_out.set_input_sync_bypass(true);
-    pif_out.set_slew_rate(SlewRate::Fast);
+    pif_out.set_pull(Pull::Up);
 
-    let program = pio_file!("src/sniff_cmd.pio");
-    let counter = pio_file!("src/counter.pio");
+    let read_cmd = pio_file!(
+        "src/si.pio",
+        select_program("read_cmd")
+    );
+    let counter = pio_file!(
+        "src/si.pio",
+        select_program("counter")
+    );
 
-    let loaded_program = pio.common.load_program(&program.program);
+    let read_cmd = pio.common.load_program(&read_cmd.program);
     let loaded_counter = pio.common.load_program(&counter.program);
-
-    let mut cfg_sniff_in = Config::default();
-    cfg_sniff_in.use_program(&loaded_program, &[]);
-    cfg_sniff_in.set_in_pins(&[&pif_in, &pif_out, &pif_clk]);
-    //cfg_sniff_in.set_in_pins(&[&pif_out, &pif_clk]);
-    //cfg_sniff_in.set_jmp_pin(&pif_in);
-    cfg_sniff_in.shift_in.direction = ShiftDirection::Left;
-    //cfg_sniff_in.shift_in.auto_fill = true;
-    //cfg_sniff_in.shift_in.threshold = 30;
-    cfg_sniff_in.clock_divider = FixedU32::ONE;
-
-    // let mut cfg_sniff_out = Config::default();
-    // cfg_sniff_out.use_program(&loaded_program, &[]);
-    // cfg_sniff_out.set_in_pins(&[&pif_clk, &pif_in, &pif_out]);
-    // cfg_sniff_out.set_jmp_pin(&pif_out);
-    // cfg_sniff_out.shift_out.direction = ShiftDirection::Left;
-    // cfg_sniff_out.shift_out.auto_fill = true;
-    // cfg_sniff_out.clock_divider = FixedU32::from_bits(0x0200);
-
-    pio.sm0.set_config(&cfg_sniff_in);
-    pio.sm0.set_enable(true);
 
     let mut cfg_counter = Config::default();
     cfg_counter.use_program(&loaded_counter, &[]);
     cfg_counter.shift_in.auto_fill = true;
     cfg_counter.clock_divider = FixedU32::ONE;
-    pio.sm1.set_config(&cfg_counter);
 
+    pio.sm1.set_config(&cfg_counter);
     unsafe {
         pio_instr_util::set_x(&mut pio.sm1, u32::MAX);
     }
     pio.sm1.set_enable(true);
 
-    let mut prev = Instant::now();
+    let mut cfg_sniff_in = Config::default();
+    cfg_sniff_in.use_program(&read_cmd, &[]);
+    cfg_sniff_in.set_in_pins(&[&pif_in]);
+    cfg_sniff_in.set_set_pins(&[&pif_out]);
+    cfg_sniff_in.set_out_pins(&[&pif_out]);
+    cfg_sniff_in.out_sticky = true;
+    cfg_sniff_in.shift_in.direction = ShiftDirection::Left;
+    //cfg_sniff_in.shift_in.auto_fill = true;
+    //cfg_sniff_in.shift_in.threshold = 30;
+    cfg_sniff_in.clock_divider = FixedU32::ONE;
+
+    pio.sm0.set_config(&cfg_sniff_in);
+
+    unsafe {
+        pio_instr_util::set_pindir(&mut pio.sm0, 1);
+        pio_instr_util::set_pin(&mut pio.sm0, 1);
+    }
+    pio.sm0.set_enable(true);
+
+    defmt::println!("Ready");
+
+    let rcp_up = Instant::now();
+
+    let ready_clks = clocks(&mut pio);
+
+    defmt::println!("PIF_IN is now high after {} clocks, out is {}", ready_clks, gpio_pif_out.is_high() as u8);
+
+    // nmi.set_low();
+    // Timer::after(Duration::from_micros(100)).await;
+    nmi.set_high();
+
+    let mut prev_clks = ready_clks;
 
     let mut count = 0;
-    //defmt::println!("Snifffing {} cycles", count);
 
-    //defmt::println!("{} words containing {} samples", WORDS, SAMPLES);
-    let mut dma = dma.into_ref();
+    loop {
+        let timer = Timer::after(Duration::from_millis(1000));
+        let cmd_packet = match select(pio.sm0.rx().wait_pull(), timer).await {
+            Either::First(cmd_packet) => cmd_packet,
+            Either::Second(_) => {
+                let clks = clocks(&mut pio);
+                match clks.checked_sub(prev_clks) {
+                    Some(diff) => defmt::println!("No command for 1s, {}", diff),
+                    None => defmt::println!("wrapped {:x} -> {:x}", prev_clks, clks),
+                };
 
-    let prev = 0;
-    let mut stop = u32::MAX;
-
-    let data_slice = unsafe { &mut DATA[0..] };
-    while count < data_slice.len() {
-        let cmd = match pio.sm0.rx().try_pull() {
-            Some(cmd) => cmd,
-            None => {
-                stop -= 1;
-                if stop < 10 {
-                    break;
+                prev_clks = clks;
+                continue;
                 }
-                continue
-            }
-        };
+            };
+        let cmd_clk = clocks(&mut pio);
+        let now = Instant::now();
 
-        stop = 1000;
+        let cmd = SiCommand::from((cmd_packet >> 9) & 0x3);
+        let addr = (cmd_packet & 0x1ff) << 2;
 
-        let cycles = (u32::MAX - 5000000) - unsafe { pio_instr_util::get_x(&mut pio.sm1) };
+        let time = now - rcp_up;
 
-        data_slice[count] = cmd << 21 | (cycles & 0x1f_ffff);
+        defmt::println!("RCP {} {:x} {:012b} @ {} ({}us)", cmd, addr, cmd_packet, cmd_clk, time.as_micros());
+
         count += 1;
-    }
-
-    for i in 0..count {
-        let cmd = data_slice[i];
-        let cmd_type = SiCommand::from(cmd >> 30);
-        let addr =  0xbfc0_0000 | ((cmd >> 21 & 0x1ff) << 2);
-        let cycles = cmd & 0x1f_ffff;
-        defmt::println!("{:?} {:08x} @ {}", cmd_type, addr, cycles);
-        if i & 0x3f == 0x3f {
-            while !net_logger::is_drained() {
-                yield_now().await;
-            }
+        if count > 30 {
+            break;
         }
     }
+
     pio.sm0.set_enable(false);
-    defmt::println!("Sniff Done");
+    defmt::println!("NMI is {}", nmi.is_set_high());
+    defmt::println!("INT2 is {}", int2.is_set_high());
 }
 
 struct Trace {
     offset: usize,
     data: &'static[u32]
-}
-
-fn deinterlace3(out: &mut [u32]) {
-    let mut data = out[0];
-    let mut more_data = [out[1], out[2]];
-    out[0] = 0;
-    out[1] = 0;
-    out[2] = 0;
-    for _ in 0..3 {
-        for _ in 0..10 {
-            out[0] = (out[0] << 1) | ((data >> 27) & 1);
-            out[1] = (out[1] << 1) | ((data >> 28) & 1);
-            out[2] = (out[2] << 1) | ((data >> 29) & 1);
-            data <<=3;
-        }
-        data = more_data[0];
-        more_data[0] = more_data[1];
-    }
-}
-
-impl defmt::Format for Trace {
-    fn format(&self, f: defmt::Formatter) {
-        for base in (0..self.data.len()).step_by(6 * 3) {
-            let top = (base + 6 * 3).min(self.data.len());
-            defmt::write!(f, "\n{}\n  in: ", (base + self.offset) * 30);
-            for i in (base..top).step_by(3) {
-                defmt::write!(f, " {:030b}", self.data[i]);
-            }
-            defmt::write!(f, "\n  out:");
-            for i in (base..top).step_by(3) {
-                defmt::write!(f, " {:030b}", self.data[i + 1]);
-            }
-            defmt::write!(f, "\n  clk:");
-            for i in (base..top).step_by(3) {
-                defmt::write!(f, " {:030b}", self.data[i + 2]);
-            }
-        }
-    }
 }
 
 #[derive(defmt::Format)]

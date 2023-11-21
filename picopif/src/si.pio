@@ -1,0 +1,35 @@
+.program read_cmd
+; pif_clk: PIN_20, pif_in: PIN_18, pif_out: PIN_19
+
+.wrap_target
+    wait 1 pin 0 ; wait for bus to be pulled high
+    wait 0 pin 0  ;  wait for start bit
+    set y, 11
+data:
+    wait 1 gpio 20 ; wait for clock high
+    wait 0 gpio 20 ; wait for falling edge of clock
+    in pins, 1
+    jmp y--, data
+    push [15]; push any remaining bits
+
+; Send a nop
+    set pins, 0 [3]
+    wait 1 gpio 20
+    set y, 31
+
+send:
+    wait 1 gpio 20 ; wait for clock high
+    wait 0 gpio 20 ; wait for falling edge of clock
+    jmp y--, send
+    set pins, 1
+.wrap
+
+.program counter
+.wrap_target
+count:
+    wait 0 gpio 20
+    jmp x--, next
+next:
+    wait 1 gpio 20
+    jmp count
+.wrap

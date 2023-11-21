@@ -210,7 +210,7 @@ async fn main(spawner: Spawner) {
 
     info!("Logs drained, continuing");
 
-    si::sniffer(p.DMA_CH3, p.PIO1, p.PIN_20, p.PIN_18, p.PIN_19).await;
+    si::sniffer(p.DMA_CH3, p.PIO1, p.PIN_20, p.PIN_18, p.PIN_19, p.PIN_21, p.PIN_22).await;
 
     loop {
         Timer::after(Duration::from_millis(1000)).await;
