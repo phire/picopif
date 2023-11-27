@@ -12,12 +12,16 @@ mod wifi_firmware;
 use core::cmp::min;
 
 use defmt::*;
-//use panic_probe as _;
+#[cfg(feature = "rtt-log")]
+use panic_probe as _;
+#[cfg(feature = "rtt-log")]
+use defmt_rtt as _;
 
 use cyw43::Control;
 use cyw43_pio::PioSpi;
 use embassy_executor::Spawner;
 use embassy_net::tcp::TcpSocket;
+#[cfg(feature = "wifi")]
 use embassy_net::{Config, Stack, StackResources};
 use embassy_rp::bind_interrupts;
 use embassy_rp::gpio::{Level, Output};
@@ -31,9 +35,11 @@ use embassy_time::{Duration, Instant, Timer};
 
 use embedded_io_async::Write;
 
-use static_cell::{make_static, StaticCell};
+use static_cell::make_static;
 
+#[cfg(feature = "wifi")]
 const WIFI_NETWORK: &str = env!("WIFI_NETWORK");
+#[cfg(feature = "wifi")]
 const WIFI_PASSWORD: &str = env!("WIFI_PASSWORD");
 
 #[cfg(feature = "usb_log")]
@@ -66,25 +72,16 @@ async fn logger_task(driver: Driver<'static, USB>) {
     embassy_usb_logger::run!(1024, log::LevelFilter::Info, driver);
 }
 
+#[cfg(feature = "net-log")]
 #[embassy_executor::task]
 async fn net_task(stack: &'static Stack<cyw43::NetDriver<'static>>) -> ! {
     stack.run().await
 }
 
+#[cfg(feature = "net-log")]
 #[embassy_executor::task]
 async fn log_drain_task(stack: &'static Stack<cyw43::NetDriver<'static>>) -> ! {
     net_logger::log_drain(stack).await
-}
-
-#[embassy_executor::task]
-async fn ping_task() -> ! {
-    let mut count = 0;
-    loop {
-        info!("ping {}", count);
-        //log::warn!("ping {}", count);
-        Timer::after(Duration::from_secs(2)).await;
-        count += 1;
-    }
 }
 
 #[cortex_m_rt::pre_init]
@@ -102,7 +99,7 @@ async fn main(spawner: Spawner) {
     let boot = Instant::now();
     let mut p = embassy_rp::init(Default::default());
 
-    println!("Booting picopif ({:08x})", net_logger::short_id());
+    println!("Booting picopif ({:08x})", build_id::short_id());
 
     #[cfg(feature = "run-from-ram")]
     {
@@ -122,6 +119,7 @@ async fn main(spawner: Spawner) {
 
     let wifi_init = Instant::now();
     let control_mutex: &'static Mutex<NoopRawMutex, Control<'static>>;
+    #[cfg(feature = "wifi")]
     let net_device;
     {
         let pwr = Output::new(p.PIN_23, Level::Low);
@@ -139,11 +137,15 @@ async fn main(spawner: Spawner) {
 
         let state = make_static!(cyw43::State::new());
         let firmware_loader = wifi_firmware::open_firmware(&mut p.FLASH, &mut p.DMA_CH1);
-        let (device, control, runner) = cyw43::new(state, pwr, spi, firmware_loader).await;
+        let (_device, control, runner) = cyw43::new(state, pwr, spi, firmware_loader).await;
         spawner.spawn(wifi_task(runner)).unwrap();
 
         control_mutex = make_static!(Mutex::<NoopRawMutex, _>::new(control));
-        net_device = device;
+
+        #[cfg(feature = "wifi")]
+        {
+            net_device = _device;
+        }
     }
 
     {
@@ -164,51 +166,57 @@ async fn main(spawner: Spawner) {
         .spawn(crate::button::button_task(&control_mutex, p.BOOTSEL))
         .unwrap();
 
-    let config = Config::dhcpv4(Default::default());
-    // Use wifi init as seed.
-    // Doesn't need to be cryptographically secure, this seems to give at least a few bits of entropy.
-    let seed = wifi_init_time.as_ticks() & 0xffffffff;
+    #[cfg(feature = "wifi")]
+    {
+        let config = Config::dhcpv4(Default::default());
+        // Use wifi init as seed.
+        // Doesn't need to be cryptographically secure, this seems to give at least a few bits of entropy.
+        let seed = wifi_init_time.as_ticks() & 0xffffffff;
 
-    static STACK_CELL: StaticCell<Stack<cyw43::NetDriver<'static>>> = StaticCell::new();
-    let stack = STACK_CELL.init(Stack::new(
-        net_device,
-        config,
-        make_static!(StackResources::<4>::new()),
-        seed,
-    ));
+        use static_cell::StaticCell;
 
-    // Start network stack before joining wifi. Otherwise the first DHCP seems to timeout.
-    spawner.spawn(net_task(stack)).unwrap();
+        static STACK_CELL: StaticCell<Stack<cyw43::NetDriver<'static>>> = StaticCell::new();
+        let stack = STACK_CELL.init(Stack::new(
+            net_device,
+            config,
+            make_static!(StackResources::<4>::new()),
+            seed,
+        ));
 
-    let wifi_join = Instant::now();
+        // Start network stack before joining wifi. Otherwise the first DHCP seems to timeout.
+        spawner.spawn(net_task(stack)).unwrap();
 
-    loop {
-        info!("Joining {}", WIFI_NETWORK);
-        let mut control = control_mutex.lock().await;
-        match control.join_wpa2(WIFI_NETWORK, WIFI_PASSWORD).await {
-            Ok(_) => break,
-            Err(err) => {
-                info!("join failed with status={}", err.status);
+        let wifi_join = Instant::now();
+
+        loop {
+            info!("Joining {}", WIFI_NETWORK);
+            let mut control = control_mutex.lock().await;
+            match control.join_wpa2(WIFI_NETWORK, WIFI_PASSWORD).await {
+                Ok(_) => break,
+                Err(err) => {
+                    info!("join failed with status={}", err.status);
+                }
             }
         }
-    }
 
-    let wifi_join_time = wifi_join.elapsed();
-    info!("Connected in {} ms", wifi_join_time.as_millis());
+        let wifi_join_time = wifi_join.elapsed();
+        info!("Connected in {} ms", wifi_join_time.as_millis());
 
+        #[cfg(feature = "net-log")]
+        {
+            spawner.spawn(log_drain_task(stack)).unwrap();
 
-    //spawner.spawn(ping_task()).unwrap();
-    spawner.spawn(log_drain_task(stack)).unwrap();
+            info!("Waiting for logs to drain");
+            loop {
+                Timer::after(Duration::from_millis(100)).await;
+                if net_logger::is_drained() {
+                    break;
+                }
+            }
 
-    info!("Waiting for logs to drain");
-    loop {
-        Timer::after(Duration::from_millis(100)).await;
-        if net_logger::is_drained() {
-            break;
+            info!("Logs drained, continuing");
         }
     }
-
-    info!("Logs drained, continuing");
 
     si::sniffer(p.DMA_CH3, p.PIO1, p.PIN_20, p.PIN_18, p.PIN_19, p.PIN_21, p.PIN_22).await;
 

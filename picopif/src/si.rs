@@ -1,7 +1,6 @@
 
 
-use defmt::{println, error};
-use embassy_futures::{yield_now, select::{select, Either}};
+use defmt::println;
 use embassy_time::{Instant, Duration, Timer};
 use pio_proc::pio_file;
 
@@ -41,8 +40,13 @@ pub async fn sniffer<DMA>(dma: impl Peripheral<P = DMA>, pio_periph: PIO1, pif_c
     let gpio_pif_out = Input::new(unsafe { pif_out.clone_unchecked() }, Pull::None);
     let mut gpio_pif_in = Input::new(unsafe { pif_in.clone_unchecked() }, Pull::Down);
 
+    #[cfg(feature = "net-log")]
     while !net_logger::is_drained() {
-        yield_now().await;
+        embassy_futures::yield_now().await;
+    }
+
+    #[cfg(feature = "rtt-log")] {
+
     }
 
     let mut dma = dma.into_ref();
