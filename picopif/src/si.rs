@@ -5,49 +5,69 @@ use embassy_futures::{yield_now, select::{select, Either}};
 use embassy_time::{Instant, Duration, Timer};
 use pio_proc::pio_file;
 
-use embassy_rp::{pio::{Pio, Config, ShiftDirection, Direction}, peripherals::*, gpio::{SlewRate, Pull, Input, self, Level, Output}, pio_instr_util, Peripheral, dma::Channel};
+use embassy_rp::{pio::{Pio, Config, ShiftDirection, Direction}, peripherals::*, gpio::{SlewRate, Pull, Input, self, Level, Output}, pio_instr_util, Peripheral, dma::Channel, pac::Interrupt::SIO_IRQ_PROC1};
 use fixed::FixedU32;
 
 use crate::Irqs;
 
+#[inline(always)]
 fn clocks(pio: &mut Pio<PIO1>) -> u32 {
     let x = unsafe { pio_instr_util::get_x(&mut pio.sm1) };
-
     u32::MAX - x
+}
+
+#[derive(Copy, Clone)]
+struct LogEntry {
+    cmd: u32,
+    //wait_count: u16,
+    diff: i32,
+}
+
+static mut SI_LOG: [LogEntry; 100] = [LogEntry { cmd: 0, diff: 0 }; 100];
+
+impl defmt::Format for LogEntry {
+    fn format(&self, fmt: defmt::Formatter) {
+        let cmd = SiCommand::from((self.cmd as u32 >> 9) & 0x3);
+        let addr = (self.cmd & 0x1ff) << 2;
+        defmt::write!(fmt, "RCP {} {:03x} {:012b} @ +{})", cmd, addr, self.cmd, self.diff);
+    }
 }
 
 pub async fn sniffer<DMA>(dma: impl Peripheral<P = DMA>, pio_periph: PIO1, pif_clk: PIN_20, pif_in: PIN_18, pif_out: PIN_19, nmi: PIN_21, int2: PIN_22) where DMA: Channel {
     let mut pio = Pio::new(pio_periph, Irqs);
 
-    let mut nmi = Output::new(nmi, Level::Low);
+    let mut nmi = Output::new(nmi, Level::High);
     let int2 = Output::new(int2, Level::High);
     let gpio_pif_out = Input::new(unsafe { pif_out.clone_unchecked() }, Pull::None);
+    let mut gpio_pif_in = Input::new(unsafe { pif_in.clone_unchecked() }, Pull::Down);
 
     while !net_logger::is_drained() {
         yield_now().await;
     }
+
+    let mut dma = dma.into_ref();
 
     let mut pif_clk: embassy_rp::pio::Pin<PIO1> = pio.common.make_pio_pin(pif_clk);
     pif_clk.set_pull(Pull::None);
     pif_clk.set_schmitt(true);
 
     let mut pif_in: embassy_rp::pio::Pin<PIO1> = pio.common.make_pio_pin(pif_in);
-    pif_in.set_pull(Pull::None);
+    pif_in.set_pull(Pull::Down);
     pif_in.set_schmitt(true);
 
     let mut pif_out: embassy_rp::pio::Pin<PIO1> = pio.common.make_pio_pin(pif_out);
     pif_out.set_pull(Pull::Up);
 
-    let read_cmd = pio_file!(
+    let process = pio_file!(
         "src/si.pio",
-        select_program("read_cmd")
+        select_program("process")
     );
     let counter = pio_file!(
         "src/si.pio",
         select_program("counter")
     );
 
-    let read_cmd = pio.common.load_program(&read_cmd.program);
+    let process = pio.common.load_program(&process.program);
     let loaded_counter = pio.common.load_program(&counter.program);
 
     let mut cfg_counter = Config::default();
@@ -61,18 +81,20 @@ pub async fn sniffer<DMA>(dma: impl Peripheral<P = DMA>, pio_periph: PIO1, pif_c
     }
     pio.sm1.set_enable(true);
 
-    let mut cfg_sniff_in = Config::default();
-    cfg_sniff_in.use_program(&read_cmd, &[]);
-    cfg_sniff_in.set_in_pins(&[&pif_in]);
-    cfg_sniff_in.set_set_pins(&[&pif_out]);
-    cfg_sniff_in.set_out_pins(&[&pif_out]);
-    cfg_sniff_in.out_sticky = true;
-    cfg_sniff_in.shift_in.direction = ShiftDirection::Left;
+    let mut cfg_process = Config::default();
+    cfg_process.use_program(&process, &[]);
+    cfg_process.set_in_pins(&[&pif_in]);
+    cfg_process.set_set_pins(&[&pif_out]);
+    cfg_process.set_out_pins(&[&pif_out]);
+    cfg_process.out_sticky = true;
+    cfg_process.shift_in.direction = ShiftDirection::Left;
     //cfg_sniff_in.shift_in.auto_fill = true;
     //cfg_sniff_in.shift_in.threshold = 30;
-    cfg_sniff_in.clock_divider = FixedU32::ONE;
+    cfg_process.shift_out.auto_fill = true;
+    cfg_process.shift_out.direction = ShiftDirection::Right;
+    cfg_process.clock_divider = FixedU32::ONE;
 
-    pio.sm0.set_config(&cfg_sniff_in);
+    pio.sm0.set_config(&cfg_process);
 
     unsafe {
         pio_instr_util::set_pindir(&mut pio.sm0, 1);
@@ -82,59 +104,48 @@ pub async fn sniffer<DMA>(dma: impl Peripheral<P = DMA>, pio_periph: PIO1, pif_c
 
     defmt::println!("Ready");
 
+    gpio_pif_in.wait_for_high().await;
+
     let rcp_up = Instant::now();
 
     let ready_clks = clocks(&mut pio);
 
+    pio.sm0.tx().push(11 | (1 << 31));
+
     defmt::println!("PIF_IN is now high after {} clocks, out is {}", ready_clks, gpio_pif_out.is_high() as u8);
 
-    // nmi.set_low();
-    // Timer::after(Duration::from_micros(100)).await;
+    nmi.set_low();
+    cortex_m::asm::delay(1);
     nmi.set_high();
 
-    let mut prev_clks = ready_clks;
+    let mut prev_clks = ready_clks as i32;
 
-    let mut count = 0;
+    let mut si_log = unsafe { &mut SI_LOG[..] };
+    let mut cmd_buf = [(32 << 16) | 11, 0u32];
 
-    loop {
-        let timer = Timer::after(Duration::from_millis(1000));
-        let cmd_packet = match select(pio.sm0.rx().wait_pull(), timer).await {
-            Either::First(cmd_packet) => cmd_packet,
-            Either::Second(_) => {
-                let clks = clocks(&mut pio);
-                match clks.checked_sub(prev_clks) {
-                    Some(diff) => defmt::println!("No command for 1s, {}", diff),
-                    None => defmt::println!("wrapped {:x} -> {:x}", prev_clks, clks),
-                };
+    while si_log.len() > 0 {
 
-                prev_clks = clks;
-                continue;
-                }
-            };
+        let cmd_packet = pio.sm0.rx().wait_pull().await;
         let cmd_clk = clocks(&mut pio);
-        let now = Instant::now();
+        si_log[0] = LogEntry { cmd: cmd_packet, diff: cmd_clk as i32 };
 
-        let cmd = SiCommand::from((cmd_packet >> 9) & 0x3);
-        let addr = (cmd_packet & 0x1ff) << 2;
+        si_log = &mut si_log[1..];
 
-        let time = now - rcp_up;
-
-        defmt::println!("RCP {} {:x} {:012b} @ {} ({}us)", cmd, addr, cmd_packet, cmd_clk, time.as_micros());
-
-        count += 1;
-        if count > 30 {
-            break;
-        }
+        // Send the response as soon as possible
+        pio.sm0.tx().dma_push(dma.reborrow(), &cmd_buf[..]).await;
     }
 
     pio.sm0.set_enable(false);
-    defmt::println!("NMI is {}", nmi.is_set_high());
-    defmt::println!("INT2 is {}", int2.is_set_high());
-}
 
-struct Trace {
-    offset: usize,
-    data: &'static[u32]
+    for entry in unsafe { &SI_LOG[..] } {
+        let diff = match entry.diff.checked_sub(prev_clks) {
+        Some(diff) => diff as i32,
+            None => -1,
+        };
+        prev_clks = entry.diff;
+
+        defmt::println!("{:?}", LogEntry { diff, ..*entry });
+    }
 }
 
 #[derive(defmt::Format)]

@@ -1,27 +1,36 @@
-.program read_cmd
+.program process
 ; pif_clk: PIN_20, pif_in: PIN_18, pif_out: PIN_19
 
 .wrap_target
-    wait 1 pin 0 ; wait for bus to be pulled high
-    wait 0 pin 0  ;  wait for start bit
-    set y, 11
-data:
-    wait 1 gpio 20 ; wait for clock high
+; Start PIO by sending a command.
+; Valid commands:
+;  0x8000_000b - Skip tx, jump straight to command rx
+;  0x0020_000b - Send 32bits of data, then queue up command rx
+;  0x0200_000b - Send 512bits of data, then queue up command rx
+;  0x0000_0020 - send 0 bit "ready" packet, then receivs 32 bits of data
+;  0x0000_0200 - send 0 bit "ready" packet, then receivs 512 bits of data
+;
+    out y, 16 ; load next in_count (11, 31 or 511)
+    out x, 15 [10]; load bit count, will be 0, 32, or 512. Leave a single zero bit in OSR
+    wait 1 gpio 20 ;
+tx_loop:
     wait 0 gpio 20 ; wait for falling edge of clock
-    in pins, 1
-    jmp y--, data
-    push [15]; push any remaining bits
+    out pins, 1 [3]
+    jmp x--, tx_loop
 
-; Send a nop
-    set pins, 0 [3]
-    wait 1 gpio 20
-    set y, 31
-
-send:
-    wait 1 gpio 20 ; wait for clock high
-    wait 0 gpio 20 ; wait for falling edge of clock
-    jmp y--, send
+; Return tx pin to high
     set pins, 1
+
+rx:
+    wait 0 pin 0 [3] ;  wait for start bit
+    ;irq 0 ; give interrupt handler early warning of incomming data
+rx_loop:
+    wait 0 gpio 20 ; wait for falling edge of clock
+    in pins, 1 [3]
+    jmp y--, rx_loop
+    push ; push any remaining bits
+
+    ; We only have about 7 clock cycles to process the data
 .wrap
 
 .program counter
