@@ -11,7 +11,7 @@ use embedded_io_async::Write;
 
 use static_cell::make_static;
 
-use crate::{logger::{get_ringbuffer, LogWaitFuture, self}, build_id};
+use crate::{logger::{get_ringbuffer, LogWaitFuture, self}};
 
 pub async fn log_drain<D: Driver>(stack: &'static Stack<D>) -> ! {
     let tx_buffer = make_static!([0; 1500]);

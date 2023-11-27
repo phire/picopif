@@ -3,9 +3,9 @@
 use core::{sync::atomic::{AtomicBool, Ordering}, future::Future, task::{Context, Poll}, pin::Pin};
 
 use embassy_sync::waitqueue::WakerRegistration;
+use build_id;
 
-use crate::{build_id, persistent_ringbuffer::PersistentRingBuffer};
-
+use crate::persistent_ringbuffer::PersistentRingBuffer;
 
 
 #[defmt::global_logger]

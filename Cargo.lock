@@ -132,6 +132,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "327762f6e5a765692301e5bb513e0d9fef63be86bbc14528052b1cd3e6f03e07"
 
 [[package]]
+name = "build-id"
+version = "0.1.0"
+
+[[package]]
 name = "bumpalo"
 version = "3.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -341,6 +345,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "269924c02afd7f94bc4cecbfa5c379f6ffcf9766b3408fe63d22c728654eccd0"
 dependencies = [
  "thiserror",
+]
+
+[[package]]
+name = "defmt-rtt"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "609923761264dd99ed9c7d209718cda4631c5fe84668e0f0960124cbb844c49f"
+dependencies = [
+ "critical-section",
+ "defmt",
 ]
 
 [[package]]
@@ -1089,6 +1103,7 @@ checksum = "8d5439c4ad607c3c23abf66de8c8bf57ba8adcd1f129e699851a6e43935d339d"
 name = "net-logger"
 version = "0.1.0"
 dependencies = [
+ "build-id",
  "cortex-m",
  "critical-section",
  "defmt",
@@ -1244,12 +1259,14 @@ dependencies = [
 name = "picopif"
 version = "0.1.0"
 dependencies = [
+ "build-id",
  "cortex-m",
  "cortex-m-rt",
  "critical-section",
  "cyw43",
  "cyw43-pio",
  "defmt",
+ "defmt-rtt",
  "embassy-executor",
  "embassy-futures",
  "embassy-net",

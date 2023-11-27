@@ -3,12 +3,10 @@
 
 mod logger;
 mod panic;
-mod build_id;
 mod persistent_ringbuffer;
 mod net;
 
 pub use net::log_drain;
-pub use build_id::*;
 
 pub fn is_drained() -> bool {
     logger::byte_count() == 0
