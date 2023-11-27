@@ -61,7 +61,7 @@
             // display of the RP2040 CPU registers in VS Code
             "svdFile": "${workspaceFolder}/.vscode/rp2040.svd",
             "rttConfig": {
-                "enabled": false,
+                "enabled": true,
                 "polling_interval": 10,
                 "clearSearch": false,
             },
@@ -81,7 +81,7 @@
                 "monitor halt",
                 "monitor reset halt",
                 "load",
-                //"monitor rtt server start 7701 0",
+                "monitor rtt server start 7701 0",
                 "monitor rp2040.core1 arp_reset assert 0",
             ],
             // Work around for stopping at main on restart
@@ -89,6 +89,7 @@
                 "monitor reset init",
                 "monitor reset halt",
                 "load",
+                "monitor rtt server start 7701 0",
                 "monitor rp2040.core1 arp_reset assert 0",
             ],
         }
