@@ -11,7 +11,7 @@
 ;  0x0000_0200 - send 0 bit "ready" packet, then receivs 512 bits of data
 ;
     out y, 16 ; load next in_count (11, 31 or 511)
-    out x, 15 [10]; load bit count, will be 0, 32, or 512. Leave a single zero bit in OSR
+    out x, 15 [10] ; load bit count, will be 0, 32, or 512. Leave a single zero bit in OSR as our start bit
     wait 1 gpio 20 ;
 tx_loop:
     wait 0 gpio 20 ; wait for falling edge of clock
