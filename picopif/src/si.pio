@@ -19,6 +19,7 @@ tx_loop:
     jmp x--, tx_loop
 
 ; Return tx pin to high
+    wait 0 gpio 20 ; wait for falling edge of clock
     set pins, 1
 
 rx:
