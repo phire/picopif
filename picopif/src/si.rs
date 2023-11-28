@@ -7,12 +7,10 @@ use embassy_time::{Instant, Duration, Timer};
 use pio::{InstructionOperands, InSource};
 use pio_proc::pio_file;
 
-use embassy_rp::{pio::{Pio, Config, ShiftDirection, Direction, Instance}, peripherals::*, gpio::{SlewRate, Pull, Input, self, Level, Output}, pio_instr_util, Peripheral, dma::Channel, pac::{Interrupt::SIO_IRQ_PROC1, self}, interrupt::typelevel::{Handler, Binding}};
+use embassy_rp::{pio::{Pio, Config, ShiftDirection, Direction, Instance}, peripherals::*, gpio::{SlewRate, Pull, Input, self, Level, Output, Flex}, pio_instr_util, Peripheral, dma::Channel, pac, interrupt::typelevel::{Handler, Binding}};
 use fixed::FixedU32;
 
 use embassy_rp::RegExt;
-
-use crate::Irqs;
 
 #[inline(always)]
 fn clocks(pio: &mut Pio<PIO1>) -> u32 {
@@ -27,7 +25,7 @@ struct LogEntry {
     diff: i32,
 }
 
-static mut SI_LOG: [LogEntry; 100] = [LogEntry { cmd: 0, wait_count: 0, diff: 0 }; 100];
+static mut SI_LOG: [LogEntry; 20] = [LogEntry { cmd: 0, wait_count: 0, diff: 0 }; 20];
 static mut COUNT: usize = 0;
 
 impl defmt::Format for LogEntry {
@@ -39,6 +37,18 @@ impl defmt::Format for LogEntry {
 }
 
 const INST : u32 = (0x02 << 26 | ((0xbfc0_0140u32) >> 2) & 0x03ff_ffff).reverse_bits();
+
+const INSTS : &[u32] = &[
+    0x3C093440u32.reverse_bits(), // 0
+    0x40896000u32.reverse_bits(), // 4
+    0x3C090006u32.reverse_bits(), // 8
+    0x3529E463u32.reverse_bits(), // c
+    0x40898000u32.reverse_bits(), // 10
+    0x3C08A404u32.reverse_bits(), // 14
+    0x00000004u32.reverse_bits(), // 18 <--- causes error???
+    0x3C08A404u32.reverse_bits(), // 1c
+    0x3C08A404u32.reverse_bits(), // 20
+];
 
 struct Si {
     cmd_buf: [u32; 2],
@@ -55,6 +65,12 @@ pub struct SiInterruptHandler<PIO> {
 impl<PIO: Instance> Handler<PIO::Interrupt> for SiInterruptHandler<PIO> {
     unsafe fn on_interrupt() {
         let pio = PIO::PIO;
+
+        // get the current clock count
+        const IN: u16 = InstructionOperands::IN {
+            source: InSource::X,
+            bit_count: 32,
+        }.encode();
         pio.sm(1).instr().write(|instr| instr.set_instr(IN));
         let clk = pio.rxf(1).read();
 
@@ -75,21 +91,18 @@ impl<PIO: Instance> Handler<PIO::Interrupt> for SiInterruptHandler<PIO> {
 
         // read data
         let cmd = pio.rxf(0).read();
+        let addr = cmd as usize & 0x1ff;
 
-        let inst = if count & 8 == 8 { INST } else { INST };
+        let inst = if addr < INSTS.len() {
+            INSTS[addr]
+        } else {
+            INST
+        };
 
         //cortex_m::asm::delay(1000);
 
         pio.txf(0).write_value((32 << 16) | 11 );
-
-        pio.txf(0).write_value( inst ); // J 0xbfc0_0088
-
-        // get the current clock count
-        const IN: u16 = InstructionOperands::IN {
-            source: InSource::X,
-            bit_count: 32,
-        }.encode();
-
+        pio.txf(0).write_value( inst );
         unsafe {
             if COUNT < SI_LOG.len() {
                 SI_LOG[COUNT] = LogEntry { cmd, wait_count, diff: clk as i32 };
@@ -106,8 +119,8 @@ unsafe impl<PIO: Instance> Binding<PIO::Interrupt, embassy_rp::pio::InterruptHan
 pub async fn sniffer<DMA>(dma: impl Peripheral<P = DMA>, pio_periph: PIO1, pif_clk: PIN_20, pif_in: PIN_18, pif_out: PIN_19, nmi: PIN_21, int2: PIN_22) where DMA: Channel {
     let mut pio = Pio::new(pio_periph, fakeIrqs);
 
-    let mut nmi = Output::new(nmi, Level::Low);
-    let int2 = Output::new(int2, Level::Low);
+    let mut nmi = Flex::new(nmi);
+    let mut int2 = Flex::new(int2);
     //let gpio_pif_out = Input::new(unsafe { pif_out.clone_unchecked() }, Pull::None);
     let mut gpio_pif_in = Input::new(unsafe { pif_in.clone_unchecked() }, Pull::Down);
 
@@ -184,6 +197,9 @@ pub async fn sniffer<DMA>(dma: impl Peripheral<P = DMA>, pio_periph: PIO1, pif_c
     defmt::println!("Ready. INST is {:08x}", INST);
 
     gpio_pif_in.wait_for_high().await;
+    let ready_clks = clocks(&mut pio);
+    let rcp_up = Instant::now();
+
     pif_out.set_pull(Pull::Up);
 
     unsafe {
@@ -191,14 +207,17 @@ pub async fn sniffer<DMA>(dma: impl Peripheral<P = DMA>, pio_periph: PIO1, pif_c
         pio_instr_util::set_pin(&mut pio.sm0, 1);
     }
 
-    let rcp_up = Instant::now();
-
     pio.sm0.tx().push(11 | (1 << 31));
 
     let raw_pio = pac::PIO1;
     raw_pio.irqs(0).inte().write_set(|m| m.set_sm0(true) );
 
-    let ready_clks = clocks(&mut pio);
+    int2.set_as_output();
+    int2.set_drive_strength(gpio::Drive::_4mA);
+    int2.set_high();
+    nmi.set_as_output();
+    nmi.set_drive_strength(gpio::Drive::_4mA);
+    nmi.set_high();
 
     defmt::println!("PIF_IN is now high after {} clocks,", ready_clks);
 
@@ -220,6 +239,11 @@ pub async fn sniffer<DMA>(dma: impl Peripheral<P = DMA>, pio_periph: PIO1, pif_c
     // Power down output pin
     pio.sm0.set_pin_dirs(Direction::In, &[&pif_out]);
     pif_out.set_pull(Pull::None);
+    int2.set_low();
+    int2.set_as_input();
+    nmi.set_low();
+    nmi.set_as_input();
+
 
     println!("Count saw {} requests", unsafe { COUNT });
 
