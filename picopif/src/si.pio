@@ -23,7 +23,7 @@ tx_loop:
 
 rx:
     wait 0 pin 0 [3] ;  wait for start bit
-    ;irq 0 ; give interrupt handler early warning of incomming data
+    irq 0 ; give interrupt handler early warning of incomming data
 rx_loop:
     wait 0 gpio 20 ; wait for falling edge of clock
     in pins, 1 [3]

@@ -128,15 +128,27 @@ pub async fn sniffer<DMA>(dma: impl Peripheral<P = DMA>, pio_periph: PIO1, pif_c
     let mut cmd_buf = [(32 << 16) | 11, 0u32];
 
     while si_log.len() > 0 {
-        let cmd_packet = pio.sm0.rx().wait_pull().await;
+        pio.irq0.wait().await;
         let cmd_clk = clocks(&mut pio);
-        si_log[0] = LogEntry { cmd: cmd_packet, diff: cmd_clk as i32 };
+        let log_entry ;
 
-        si_log = &mut si_log[1..];
+        (log_entry, si_log) = si_log.split_first_mut().unwrap();
 
         // Send the response as soon as possible
         cmd_buf[1] = 0x00000000;
         pio.sm0.tx().dma_push(dma.reborrow(), &cmd_buf[..]).await;
+
+        let cmd_packet;
+        loop {
+            match pio.sm0.rx().try_pull() {
+                Some(val) => {
+                    cmd_packet = val;
+                    break;
+                }
+                None => {}
+            }
+        }
+        *log_entry = LogEntry { cmd: cmd_packet, diff: cmd_clk as i32 };
     }
 
     pio.sm0.set_enable(false);
