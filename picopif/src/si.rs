@@ -1,11 +1,16 @@
 
 
+use core::marker::PhantomData;
+
 use defmt::println;
 use embassy_time::{Instant, Duration, Timer};
+use pio::{InstructionOperands, InSource};
 use pio_proc::pio_file;
 
-use embassy_rp::{pio::{Pio, Config, ShiftDirection, Direction}, peripherals::*, gpio::{SlewRate, Pull, Input, self, Level, Output}, pio_instr_util, Peripheral, dma::Channel, pac::Interrupt::SIO_IRQ_PROC1};
+use embassy_rp::{pio::{Pio, Config, ShiftDirection, Direction, Instance}, peripherals::*, gpio::{SlewRate, Pull, Input, self, Level, Output}, pio_instr_util, Peripheral, dma::Channel, pac::{Interrupt::SIO_IRQ_PROC1, self}, interrupt::typelevel::{Handler, Binding}};
 use fixed::FixedU32;
+
+use embassy_rp::RegExt;
 
 use crate::Irqs;
 
@@ -18,22 +23,85 @@ fn clocks(pio: &mut Pio<PIO1>) -> u32 {
 #[derive(Copy, Clone)]
 struct LogEntry {
     cmd: u32,
-    //wait_count: u16,
+    wait_count: u16,
     diff: i32,
 }
 
-static mut SI_LOG: [LogEntry; 100] = [LogEntry { cmd: 0, diff: 0 }; 100];
+static mut SI_LOG: [LogEntry; 100] = [LogEntry { cmd: 0, wait_count: 0, diff: 0 }; 100];
+static mut COUNT: usize = 0;
 
 impl defmt::Format for LogEntry {
     fn format(&self, fmt: defmt::Formatter) {
         let cmd = SiCommand::from((self.cmd as u32 >> 9) & 0x3);
         let addr = (self.cmd & 0x1ff) << 2;
-        defmt::write!(fmt, "RCP {} {:03x} {:012b} @ +{})", cmd, addr, self.cmd, self.diff);
+        defmt::write!(fmt, "RCP {} {:03x} {:012b} @ +{} ({} cycle wait)", cmd, addr, self.cmd, self.diff, self.wait_count);
     }
 }
 
+struct Si {
+    cmd_buf: [u32; 2],
+}
+
+static mut SI_INSTANCE : Si = Si {
+    cmd_buf: [(32 << 16) | 11, 0u32]
+};
+
+pub struct SiInterruptHandler<PIO> {
+    _pio: PhantomData<PIO>,
+}
+
+impl<PIO: Instance> Handler<PIO::Interrupt> for SiInterruptHandler<PIO> {
+    unsafe fn on_interrupt() {
+        let pio = PIO::PIO;
+        let ints = pio.irqs(0).ints().read();
+        let si = &mut SI_INSTANCE;
+
+        if !ints.sm0() {
+            defmt::warn!("Unexpected interrupt {:x}", ints.0);
+            return;
+        }
+        pio.irq().write(|irq| irq.set_irq(1));
+
+        let mut wait_count = 0u16;
+
+        // Wait for data to be ready
+        while (pio.fstat().read().rxempty() & 1) == 1 { wait_count = wait_count.wrapping_add(1); }
+
+        // read data
+        let cmd = pio.rxf(0).read();
+
+        pio.txf(0).write_value((32 << 16) | 11 );
+        pio.txf(0).write_value( 0x00000000 );
+
+        //si.cmd_buf[1] = 0x00000000; // nop
+
+        // get the current clock count
+        const IN: u16 = InstructionOperands::IN {
+            source: InSource::X,
+            bit_count: 32,
+        }.encode();
+
+        pio.sm(1).instr().write(|instr| instr.set_instr(IN));
+        let clk = pio.rxf(1).read();
+
+        unsafe {
+            if COUNT < SI_LOG.len() {
+                SI_LOG[COUNT] = LogEntry { cmd, wait_count, diff: clk as i32 };
+            }
+            COUNT += 1;
+        }
+
+        // respond
+        //PIO::PIO.irqs(0).inte().write_clear(|m| m.0 = ints.0);
+
+    }
+}
+
+struct fakeIrqs;
+unsafe impl<PIO: Instance> Binding<PIO::Interrupt, embassy_rp::pio::InterruptHandler<PIO>> for fakeIrqs {}
+
 pub async fn sniffer<DMA>(dma: impl Peripheral<P = DMA>, pio_periph: PIO1, pif_clk: PIN_20, pif_in: PIN_18, pif_out: PIN_19, nmi: PIN_21, int2: PIN_22) where DMA: Channel {
-    let mut pio = Pio::new(pio_periph, Irqs);
+    let mut pio = Pio::new(pio_periph, fakeIrqs);
 
     let mut nmi = Output::new(nmi, Level::High);
     let int2 = Output::new(int2, Level::High);
@@ -48,8 +116,6 @@ pub async fn sniffer<DMA>(dma: impl Peripheral<P = DMA>, pio_periph: PIO1, pif_c
     #[cfg(feature = "rtt-log")] {
 
     }
-
-    let mut dma = dma.into_ref();
 
     let mut pif_clk: embassy_rp::pio::Pin<PIO1> = pio.common.make_pio_pin(pif_clk);
     pif_clk.set_pull(Pull::None);
@@ -77,6 +143,7 @@ pub async fn sniffer<DMA>(dma: impl Peripheral<P = DMA>, pio_periph: PIO1, pif_c
     let mut cfg_counter = Config::default();
     cfg_counter.use_program(&loaded_counter, &[]);
     cfg_counter.shift_in.auto_fill = true;
+    cfg_counter.shift_out.auto_fill = true;
     cfg_counter.clock_divider = FixedU32::ONE;
 
     pio.sm1.set_config(&cfg_counter);
@@ -112,9 +179,14 @@ pub async fn sniffer<DMA>(dma: impl Peripheral<P = DMA>, pio_periph: PIO1, pif_c
 
     let rcp_up = Instant::now();
 
+    pio.sm0.tx().push(11 | (1 << 31));
+
+
+    let raw_pio = pac::PIO1;
+    raw_pio.irqs(0).inte().write_set(|m| m.set_sm0(true) );
+
     let ready_clks = clocks(&mut pio);
 
-    pio.sm0.tx().push(11 | (1 << 31));
 
     defmt::println!("PIF_IN is now high after {} clocks, out is {}", ready_clks, gpio_pif_out.is_high() as u8);
 
@@ -124,36 +196,18 @@ pub async fn sniffer<DMA>(dma: impl Peripheral<P = DMA>, pio_periph: PIO1, pif_c
 
     let mut prev_clks = ready_clks as i32;
 
-    let mut si_log = unsafe { &mut SI_LOG[..] };
-    let mut cmd_buf = [(32 << 16) | 11, 0u32];
-
-    while si_log.len() > 0 {
-        pio.irq0.wait().await;
-        let cmd_clk = clocks(&mut pio);
-        let log_entry ;
-
-        (log_entry, si_log) = si_log.split_first_mut().unwrap();
-
-        // Send the response as soon as possible
-        cmd_buf[1] = 0x00000000;
-        pio.sm0.tx().dma_push(dma.reborrow(), &cmd_buf[..]).await;
-
-        let cmd_packet;
-        loop {
-            match pio.sm0.rx().try_pull() {
-                Some(val) => {
-                    cmd_packet = val;
-                    break;
-                }
-                None => {}
-            }
-        }
-        *log_entry = LogEntry { cmd: cmd_packet, diff: cmd_clk as i32 };
+    while unsafe { COUNT } == 0 {
+        Timer::after(Duration::from_millis(1)).await;
     }
 
-    pio.sm0.set_enable(false);
+    Timer::after(Duration::from_millis(100)).await;
 
-    for entry in unsafe { &SI_LOG[..] } {
+    println!("Count saw {} requests", unsafe { COUNT });
+
+    pio.sm0.set_enable(false);
+    raw_pio.irqs(0).inte().write_set(|m| m.set_sm0(false) );
+
+    for entry in unsafe { &SI_LOG[..COUNT.min(SI_LOG.len())] } {
         let diff = match entry.diff.checked_sub(prev_clks) {
         Some(diff) => diff as i32,
             None => -1,
@@ -161,6 +215,7 @@ pub async fn sniffer<DMA>(dma: impl Peripheral<P = DMA>, pio_periph: PIO1, pif_c
         prev_clks = entry.diff;
 
         defmt::println!("{:?}", LogEntry { diff, ..*entry });
+        Timer::after(Duration::from_millis(1)).await;
     }
 }
 

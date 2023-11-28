@@ -52,7 +52,7 @@ bind_interrupts!(struct Irqs {
 #[cfg(not(feature = "usb_log"))]
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => PioInterruptHandler<PIO0>;
-    PIO1_IRQ_0 => PioInterruptHandler<PIO1>;
+    PIO1_IRQ_0 => si::SiInterruptHandler<PIO1>;
 });
 
 #[embassy_executor::task]
