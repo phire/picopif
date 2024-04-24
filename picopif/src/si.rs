@@ -25,29 +25,35 @@ struct LogEntry {
     diff: i32,
 }
 
-static mut SI_LOG: [LogEntry; 20] = [LogEntry { cmd: 0, wait_count: 0, diff: 0 }; 20];
+static mut SI_LOG: [LogEntry; 100] = [LogEntry { cmd: 0, wait_count: 0, diff: 0 }; 100];
 static mut COUNT: usize = 0;
 
 impl defmt::Format for LogEntry {
     fn format(&self, fmt: defmt::Formatter) {
-        let cmd = SiCommand::from((self.cmd as u32 >> 9) & 0x3);
-        let addr = (self.cmd & 0x1ff) << 2;
+        let cmd = SiCommand::from((self.cmd as u32 >> 10) & 0x3);
+        let addr = (self.cmd & 0x3fe) << 1;
         defmt::write!(fmt, "RCP {} {:03x} {:012b} @ +{} ({} cycle wait)", cmd, addr, self.cmd, self.diff, self.wait_count);
     }
 }
 
-const INST : u32 = (0x02 << 26 | ((0xbfc0_0140u32) >> 2) & 0x03ff_ffff).reverse_bits();
+const INST : u32 = (0x02 << 26 | ((0xbfc0_0140u32) >> 2) & 0x03ff_ffff);
 
 const INSTS : &[u32] = &[
-    0x3C093440u32.reverse_bits(), // 0
-    0x40896000u32.reverse_bits(), // 4
-    0x3C090006u32.reverse_bits(), // 8
-    0x3529E463u32.reverse_bits(), // c
-    0x40898000u32.reverse_bits(), // 10
-    0x3C08A404u32.reverse_bits(), // 14
-    0x00000004u32.reverse_bits(), // 18 <--- causes error???
-    0x3C08A404u32.reverse_bits(), // 1c
-    0x3C08A404u32.reverse_bits(), // 20
+    0x3C093440, // 0
+    0x40896000, // 4
+    0x3C090006, // 8
+    0x3529E463, // c
+    0x40898000, // 14
+    0x3C08A404, // 18
+    0x3C08A404, // 20
+    0x3C01BFC0, // 24 at = 0xbfc00000
+    0x3C02dead, // 28 v0 = 0xdead0000
+    0x3442beef, // 2c v0 = 0xdeadbeef
+    0xac2207cc, // 2c sw v0, 0x7cc(at)
+    0x3C093440, // 2c
+    0x3C093440, // 30
+    0x3C093440, // 34
+    0x3C093440, // 38
 ];
 
 struct Si {
@@ -90,38 +96,87 @@ impl<PIO: Instance> Handler<PIO::Interrupt> for SiInterruptHandler<PIO> {
         while (pio.fstat().read().rxempty() & 1) == 1 { wait_count = wait_count.wrapping_add(1); }
 
         // read data
-        let cmd = pio.rxf(0).read();
-        let addr = cmd as usize & 0x1ff;
+        let packet = pio.rxf(0).read();
 
-        let inst = if addr < INSTS.len() {
-            INSTS[addr]
-        } else {
-            INST
-        };
-
-        //cortex_m::asm::delay(1000);
-
-        pio.txf(0).write_value((32 << 16) | 11 );
-        pio.txf(0).write_value( inst );
         unsafe {
             if COUNT < SI_LOG.len() {
-                SI_LOG[COUNT] = LogEntry { cmd, wait_count, diff: clk as i32 };
+                SI_LOG[COUNT] = LogEntry { cmd: packet, wait_count, diff: clk as i32 };
             }
             COUNT += 1;
         }
 
+        if packet == 0 {
+            // this is probably a reset command
+            for i in 0..10000 {
+                if pac::IO_BANK0.gpio(18).status().read().infrompad() {
+                    pio.txf(0).write_value((32 << 1) | (11 << 16) );
+                    pio.txf(0).write_value( 0 );
+                    println!("Reset after {} loops", i);
+                    return;
+                }
+            }
+            println!("Reset not detected");
+            return;
+        }
+
+        let cmd = SiCommand::from((packet >> 10) & 0x3);
+        let addr = (packet >> 1) as usize & 0x1ff;
+
+        match cmd {
+            SiCommand::Write64 => {
+                // Untested
+                let mut data = [0u32; 16];
+                pio.txf(0).write_value( (511 << 16) | 0 );
+                pio.txf(0).write_value(1 | (11 << 16) );
+                for i in 0..16 {
+                    while (pio.fstat().read().rxempty() & 1) == 1 { };
+                    data[i] = pio.rxf(0).read();
+                }
+                defmt::info!("Write64 {:03x} {:08x}", addr, data);
+            }
+            SiCommand::Read64 => {
+                //defmt::error!("Read64 not implemented");
+                pio.txf(0).write_value((512 << 1) | (10 << 16) );
+                for i in 0..16 {
+                    pio.txf(0).write_value( addr as u32 + i);
+                }
+            }
+            SiCommand::Write4 => {
+                pio.txf(0).write_value( (31 << 16) | 0 );
+                pio.txf(0).write_value(1 | (11 << 16) );
+
+                while (pio.fstat().read().rxempty() & 1) == 1 { };
+                let data = pio.rxf(0).read();
+
+                //println!("Write4 {:03x} {:08x}", addr, data);
+            },
+            SiCommand::Read4 => {
+                let inst = if addr < INSTS.len() {
+                    INSTS[addr]
+                } else {
+                    INST
+                };
+
+                println!("Read4 {:03x} {:08x}", addr << 2, inst);
+
+                pio.txf(0).write_value((32 << 1) | (11 << 16) );
+                pio.txf(0).write_value( inst );
+            }
+        }
+
+        cortex_m::asm::delay(1000);
+
     }
 }
 
-struct fakeIrqs;
-unsafe impl<PIO: Instance> Binding<PIO::Interrupt, embassy_rp::pio::InterruptHandler<PIO>> for fakeIrqs {}
+struct FakeIrqs;
+unsafe impl<PIO: Instance> Binding<PIO::Interrupt, embassy_rp::pio::InterruptHandler<PIO>> for FakeIrqs {}
 
 pub async fn sniffer<DMA>(dma: impl Peripheral<P = DMA>, pio_periph: PIO1, pif_clk: PIN_20, pif_in: PIN_18, pif_out: PIN_19, nmi: PIN_21, int2: PIN_22) where DMA: Channel {
-    let mut pio = Pio::new(pio_periph, fakeIrqs);
+    let mut pio = Pio::new(pio_periph, FakeIrqs);
 
     let mut nmi = Flex::new(nmi);
     let mut int2 = Flex::new(int2);
-    //let gpio_pif_out = Input::new(unsafe { pif_out.clone_unchecked() }, Pull::None);
     let mut gpio_pif_in = Input::new(unsafe { pif_in.clone_unchecked() }, Pull::Down);
 
     #[cfg(feature = "net-log")]
@@ -177,20 +232,12 @@ pub async fn sniffer<DMA>(dma: impl Peripheral<P = DMA>, pio_periph: PIO1, pif_c
     cfg_process.set_out_pins(&[&pif_out]);
     cfg_process.out_sticky = true;
     cfg_process.shift_in.direction = ShiftDirection::Left;
-    //cfg_sniff_in.shift_in.auto_fill = true;
-    //cfg_sniff_in.shift_in.threshold = 30;
+    cfg_process.shift_in.auto_fill = true;
     cfg_process.shift_out.auto_fill = true;
-    cfg_process.shift_out.direction = ShiftDirection::Right;
+    cfg_process.shift_out.direction = ShiftDirection::Left;
     cfg_process.clock_divider = FixedU32::ONE;
 
-    unsafe {
-        pio_instr_util::set_pindir(&mut pio.sm0, 0);
-        pio_instr_util::set_pin(&mut pio.sm0, 0);
-    }
-
     pio.sm0.set_config(&cfg_process);
-    pio.sm0.set_pin_dirs(Direction::In, &[&pif_out]);
-
     pio.sm0.set_enable(true);
 
 
@@ -207,17 +254,17 @@ pub async fn sniffer<DMA>(dma: impl Peripheral<P = DMA>, pio_periph: PIO1, pif_c
         pio_instr_util::set_pin(&mut pio.sm0, 1);
     }
 
-    pio.sm0.tx().push(11 | (1 << 31));
+    pio.sm0.tx().push((11 << 16) | 1);
 
     let raw_pio = pac::PIO1;
     raw_pio.irqs(0).inte().write_set(|m| m.set_sm0(true) );
 
-    int2.set_as_output();
-    int2.set_drive_strength(gpio::Drive::_4mA);
-    int2.set_high();
-    nmi.set_as_output();
-    nmi.set_drive_strength(gpio::Drive::_4mA);
-    nmi.set_high();
+    // int2.set_as_output();
+    // int2.set_drive_strength(gpio::Drive::_4mA);
+    // int2.set_high();
+    // nmi.set_as_output();
+    // nmi.set_drive_strength(gpio::Drive::_4mA);
+    // nmi.set_high();
 
     defmt::println!("PIF_IN is now high after {} clocks,", ready_clks);
 
@@ -254,7 +301,7 @@ pub async fn sniffer<DMA>(dma: impl Peripheral<P = DMA>, pio_periph: PIO1, pif_c
 
     for entry in unsafe { &SI_LOG[..COUNT.min(SI_LOG.len())] } {
         let diff = match entry.diff.checked_sub(prev_clks) {
-        Some(diff) => diff as i32,
+            Some(diff) => diff as i32,
             None => -1,
         };
         prev_clks = entry.diff;
@@ -264,22 +311,23 @@ pub async fn sniffer<DMA>(dma: impl Peripheral<P = DMA>, pio_periph: PIO1, pif_c
     }
 }
 
-#[derive(defmt::Format)]
+#[derive(Clone, Copy, defmt::Format)]
 enum SiCommand {
     Write64 = 0,
-    Write4 = 1,
-    Read64 = 2,
+    Read64 = 1,
+    Write4 = 2,
     Read4 = 3,
 }
 
 impl From<u32> for SiCommand {
+    #[inline(always)]
     fn from(cmd: u32) -> Self {
         match cmd {
             0 => SiCommand::Write64,
-            1 => SiCommand::Write4,
-            2 => SiCommand::Read64,
+            1 => SiCommand::Read64,
+            2 => SiCommand::Write4,
             3 => SiCommand::Read4,
-            _ => panic!("Invalid command {}", cmd),
+            _ => SiCommand::Read4,
         }
     }
 }

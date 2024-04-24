@@ -84,12 +84,14 @@
                 "monitor rtt server start 7701 0",
                 "monitor rp2040.core1 arp_reset assert 0",
             ],
-            // Work around for stopping at main on restart
+
+            "preRestartCommands": [
+                "monitor rtt stop"
+            ],
             "postRestartCommands": [
                 "monitor reset init",
                 "monitor reset halt",
                 "load",
-                "monitor rtt server start 7701 0",
                 "monitor rp2040.core1 arp_reset assert 0",
             ],
         }
